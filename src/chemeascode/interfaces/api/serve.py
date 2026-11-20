@@ -759,6 +759,8 @@ def _classify_pid_object(element: etree._Element) -> tuple[str, str]:
         return "instrument", "仪表"
     if cls.endswith("OffPageConnector"):
         return "connector", "跨页连接"
+    if obj_id.startswith("Dim_"):
+        return "annotation", "尺寸标注"
     if el_type.startswith("Plant/Piping."):
         return "fitting", "管件/特殊件"
     return "other", "对象"
@@ -1060,6 +1062,24 @@ def _str_val(value: Any) -> str | None:
         if "value" in value:
             unit = value.get("unit") or ""
             return f"{value['value']} {unit}".strip()
+        if any(k in value for k in ("diameter", "height", "length", "width", "depth")):
+            parts: list[str] = []
+            d = value.get("diameter")
+            h = value.get("height")
+            ln = value.get("length")
+            w = value.get("width") if value.get("width") is not None else value.get("depth")
+            if isinstance(d, (int, float)):
+                parts.append(f"Ø{d:g} m")
+            if isinstance(ln, (int, float)) and isinstance(d, (int, float)):
+                parts.append(f"L {ln:g} m")
+            elif isinstance(h, (int, float)) and isinstance(d, (int, float)):
+                parts.append(f"H {h:g} m")
+            else:
+                for val, lbl in ((ln, "L"), (w, "W"), (h, "H")):
+                    if isinstance(val, (int, float)):
+                        parts.append(f"{lbl} {val:g} m")
+            if parts:
+                return " × ".join(parts)
         return None
     text = str(value).strip()
     return text or None
@@ -1119,7 +1139,7 @@ def _inspect_pid_object(
     else:
         for anc in element.iterancestors("Object"):
             anc_cls = short_class(anc)
-            if anc_cls not in ("PlantModel", "EngineeringModel"):
+            if anc_cls not in ("PlantModel", "EngineeringModel", "Diagram", "Drawing"):
                 owner_el = anc
                 break
 
@@ -1785,9 +1805,40 @@ def _inspect_pid_object(
                 actuator_op = "电动"
             elif "手动" in notes_text:
                 actuator_op = "手动"
-        set_p = _from_ds("set_pressure_barg", "SetPressure")
-        if set_p and "set_pressure_barg" in li and not any(u in set_p.lower() for u in ("bar", "kpa", "mpa")):
-            set_p = f"{set_p} barg"
+        def _format_set_pressure(raw: Any, is_barg: bool) -> str | None:
+            if raw is None:
+                return None
+            if is_barg and isinstance(raw, (int, float)):
+                v = float(raw)
+                if abs(v) < 0.1 and v != 0:
+                    sign = "+" if v > 0 else ""
+                    return f"{sign}{v * 100:g} kPa(g) ({v:g} barg)"
+                return f"{v:g} barg"
+            s = _str_val(raw)
+            if not s:
+                return None
+            if is_barg and not any(u in s.lower() for u in ("bar", "kpa", "mpa")):
+                return f"{s} barg"
+            return s
+
+        set_p = (
+            _format_set_pressure(li["set_pressure_barg"], True)
+            if li.get("set_pressure_barg") is not None
+            else _format_set_pressure(attributes.get("SetPressure") or ds.get("SetPressure"), False)
+        )
+        vac_p = (
+            _format_set_pressure(li["vacuum_set_pressure_barg"], True)
+            if li.get("vacuum_set_pressure_barg") is not None
+            else _format_set_pressure(attributes.get("VacuumSetPressure") or ds.get("VacuumSetPressure"), False)
+        )
+        pressure_rows = (
+            [
+                {"label": "正压整定压力", "key": "SetPressure", "value": set_p},
+                {"label": "负压整定压力", "key": "VacuumSetPressure", "value": vac_p},
+            ]
+            if (dexpi_class == "BreatherValve" or vac_p is not None)
+            else [{"label": "整定压力", "key": "SetPressure", "value": set_p}]
+        )
         properties = [
             {"label": "位号", "key": "Tag", "value": tag},
             {"label": "阀门类型", "key": "DEXPI Class", "value": dexpi_class},
@@ -1798,7 +1849,7 @@ def _inspect_pid_object(
             {"label": "连接形式", "key": "end_connection", "value": _from_ds("end_connection", "EndConnection")},
             {"label": "故障位", "key": "FailPosition", "value": fail_position},
             {"label": "驱动方式", "key": "Operation", "value": actuator_op},
-            {"label": "整定压力", "key": "SetPressure", "value": set_p},
+            *pressure_rows,
             {"label": "备注", "key": "notes", "value": notes_text},
         ]
     elif category == "fitting":
@@ -1921,6 +1972,21 @@ def _inspect_pid_object(
             {"label": "管道等级", "key": "PipingClassCode", "value": piping_class},
             {"label": "备注", "key": "notes", "value": _from_ds("notes")},
         ]
+    elif category == "annotation":
+        texts = [
+            t.strip()
+            for t in (
+                data_value(sub, "Text")
+                for sub in element.iter("Object")
+                if sub.get("type") == "Core/Diagram.Text"
+            )
+            if isinstance(t, str) and t.strip()
+        ]
+        properties = [
+            {"label": "标注标识", "key": "Tag", "value": tag or resolved_id},
+            {"label": "类型", "key": "DEXPI Class", "value": "尺寸标注"},
+            {"label": "标注内容", "key": "texts", "value": " / ".join(texts) or None},
+        ]
     else:
         properties = [
             {"label": "标识", "key": "id", "value": resolved_id},
@@ -1931,6 +1997,30 @@ def _inspect_pid_object(
     span = sheet.span.get(element)
     xml_lines = [span[0], span[1]] if span else ([element.sourceline, element.sourceline] if element.sourceline else None)
 
+    position: list[float] | None = None
+    for rg in sheet.drawings.get(resolved_id, []):
+        for sub in rg.iter("Object"):
+            if "NodePosition" in (sub.get("type") or "") or (sub.get("id") or "").endswith("_Pos"):
+                for agg in sub.iter("AggregatedDataValue"):
+                    if agg.get("type") == "Core/Diagram.Point":
+                        coords: dict[str, float] = {}
+                        for d_el in agg.findall("Data"):
+                            prop = d_el.get("property")
+                            if prop in ("X", "Y"):
+                                raw_c = next((d_el.findtext(tag_n) for tag_n in ("Double", "Integer", "String") if d_el.findtext(tag_n)), None)
+                                if raw_c is not None:
+                                    try:
+                                        coords[prop] = float(raw_c.strip())
+                                    except ValueError:
+                                        pass
+                        if "X" in coords and "Y" in coords:
+                            position = [round(coords["X"], 3), round(coords["Y"], 3)]
+                            break
+            if position is not None:
+                break
+        if position is not None:
+            break
+
     return {
         "id": resolved_id,
         "dexpi_class": dexpi_class,
@@ -1938,6 +2028,7 @@ def _inspect_pid_object(
         "category_label": category_label,
         "tag": tag,
         "owner": owner,
+        "position": position,
         "attributes": attributes,
         "properties": properties,
         "list_info": list_info,

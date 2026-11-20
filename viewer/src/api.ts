@@ -3072,6 +3072,7 @@ export interface PidObjectInfo {
   category_label: string;
   tag: string | null;
   owner: PidObjectRef | null;
+  position?: [number, number] | null;
   attributes: Record<string, string>;
   properties: PidObjectProperty[];
   list_info: Record<string, unknown> | null;

@@ -15,6 +15,10 @@ class PipingItem(Strict):
     line: Identifier | None = Field(default=None, description="Line number it sits on.")
     sheet: str | None = Field(default=None, description="Sheet id it is drawn on.")
     set_pressure_barg: float | None = Field(default=None, description="Relief devices.")
+    vacuum_set_pressure_barg: float | None = Field(
+        default=None,
+        description="Vacuum / negative set pressure for breather/vacuum-relief valves, barg.",
+    )
     relief_case: str = Field(default="", description="Governing relief case, for relief devices.")
     notes: str = ""
 

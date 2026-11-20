@@ -25,6 +25,7 @@ const path = computed(() => paramPath(route.params.path));
 const view = createView();
 const picked = ref<Picked | null>(null);
 const pane = ref<InstanceType<typeof SvgPane> | null>(null);
+const pendingPointFocus = ref<string | null>(null);
 
 const svg = useAsync(async (signal) => sanitizeSvg(await api.pidSvg(path.value, rev.value, signal)), [path, rev]);
 watch(picked, (object) => signalEmbedSelection(object?.id ?? null));
@@ -68,8 +69,16 @@ function focusObject(id: string): void {
   const target = el?.id || id;
   const texts = el ? [...new Set(Array.from(el.querySelectorAll("text"), (t) => (t.textContent ?? "").trim()).filter(Boolean))] : [];
   picked.value = { id: target, layer: "pid-layer", className: el?.getAttribute("class") ?? "", texts: texts.slice(0, 20) };
-  pane.value?.focus(target);
+  const focused = pane.value?.focus(target) ?? false;
+  pendingPointFocus.value = focused ? null : target;
 }
+watch(objectInfo.data, (info) => {
+  if (!info || !pendingPointFocus.value) return;
+  if (info.id === pendingPointFocus.value || picked.value?.id === pendingPointFocus.value) {
+    if (info.position) pane.value?.focusPoint(info.position[0], info.position[1]);
+    pendingPointFocus.value = null;
+  }
+});
 const layers = computed(() => [{ id: "pid-layer", svg: svg.data.value }]);
 const css = computed(() => selectionCss("pid-layer", picked.value?.id ?? null));
 /**

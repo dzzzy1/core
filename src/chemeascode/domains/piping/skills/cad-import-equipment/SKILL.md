@@ -26,9 +26,10 @@ Use this skill when extracting major process equipment, package skids, nozzle po
    - Attach nominal diameter (`DN`) when explicitly labeled on the nozzle or unequivocally inherited from its connected line; leave unset (`None`) when indeterminate (e.g., unassigned blinded spare nozzles) rather than guessing.
 3. **Rescued instrument taps on equipment heads**:
    - Check remote-origin `INSERT` gauge/transmitter blocks anchored over top instrument nozzles (`P1`, `P2`, `L1`, etc.) and ensure the corresponding nozzle object and port coordinate exist in the equipment spec even if the gauge isolation valve belongs to the instrument or valve specialist.
-4. **Sync `equipment/equipment-list.yaml` without fabrication**:
-   - Populate `tag`, `type`/`name`, `sheet`, and brief `notes` observable on the P&ID (service title, approximate volume or design pressure shown directly in equipment notes).
-   - Leave unstated design temperatures, corrosion allowances, metallurgy, and pump duties blank (`null` / omitted) pending process datasheets.
+4. **Sync `equipment/equipment-list.yaml` and separate CAD dimension callouts**:
+   - Keep pure CAD dimension callouts (extension lines, arrowheads, height/elevation/span texts) in dedicated drawing-level `<Static id="Dim_*">` groups rather than bundling them into equipment `RepresentationGroup`s, preventing false `label-overlap` warnings and keeping vessel outlines clean when clicked.
+   - Populate `tag`, `type`/`name`, `sheet`, structured `dimensions` (`diameter`, `height`/`length`, `source`), and `notes` observable on the P&ID (including extracted seal depths or sight-glass spans), plus instrument span notes on the related gauge/level indicator.
+   - Leave unstated design pressures, design temperatures, corrosion allowances, metallurgy, and pump duties blank (`null` / omitted) pending process datasheets.
 
 ## Output schema / hand-off
 

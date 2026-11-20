@@ -96,13 +96,15 @@ function focus(objectId: string, layerId?: string): boolean {
     const target = host.querySelector(`[id="${cssString(objectId)}"]`);
     if (!target) continue;
     const box = target.getBoundingClientRect();
+    if (box.width === 0 && box.height === 0) return false;
     const origin = stage.getBoundingClientRect();
     const k = props.view.k;
     const cx = (box.left + box.width / 2 - origin.left) / k;
     const cy = (box.top + box.height / 2 - origin.top) / k;
-    const span = Math.max(box.width / k, box.height / k, 1);
+    if (cx < -50 || cy < -50 || cx > size.value.width + 50 || cy > size.value.height + 50) return false;
+    const span = Math.max(box.width / k, box.height / k, 8);
     const wanted = Math.min(el.clientWidth, el.clientHeight) / (span * 4);
-    if (wanted > k) props.view.k = Math.min(wanted, 40);
+    if (wanted > k) props.view.k = Math.min(wanted, 16);
     props.view.x = el.clientWidth / 2 - cx * props.view.k;
     props.view.y = el.clientHeight / 2 - cy * props.view.k;
     return true;
@@ -110,7 +112,22 @@ function focus(objectId: string, layerId?: string): boolean {
   return false;
 }
 
-defineExpose({ fit, zoomBy, focus });
+/**
+ * Fallback focus when a picked object (such as an internal virtual off-page connector) has no
+ * drawn SVG strokes of its own, panning smoothly to its sheet coordinates `(cx, cy)` in mm.
+ */
+function focusPoint(cx: number, cy: number): boolean {
+  const el = container.value;
+  if (!el) return false;
+  if (cx < -50 || cy < -50 || cx > size.value.width + 50 || cy > size.value.height + 50) return false;
+  const wanted = Math.min(el.clientWidth, el.clientHeight) / (24 * 4);
+  if (wanted > props.view.k) props.view.k = Math.min(wanted, 8);
+  props.view.x = el.clientWidth / 2 - cx * props.view.k;
+  props.view.y = el.clientHeight / 2 - cy * props.view.k;
+  return true;
+}
+
+defineExpose({ fit, zoomBy, focus, focusPoint });
 
 watch(
   () => props.layers.map((l) => [l.id, l.svg] as const),
