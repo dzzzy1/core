@@ -1085,6 +1085,160 @@ def _str_val(value: Any) -> str | None:
     return text or None
 
 
+_PHYSICAL_QUANTITY_UNIT_LABELS: dict[tuple[str, str], str] = {
+    ("PressureGaugeUnit", "Kilopascal"): "kPa(g)",
+    ("PressureGaugeUnit", "Bar"): "barg",
+    ("PressureGaugeUnit", "Megapascal"): "MPa(g)",
+    ("PressureAbsoluteUnit", "Kilopascal"): "kPa(a)",
+    ("PressureAbsoluteUnit", "Bar"): "bara",
+    ("PressureAbsoluteUnit", "Megapascal"): "MPa(a)",
+    ("LengthUnit", "Millimetre"): "mm",
+    ("LengthUnit", "Metre"): "m",
+    ("TemperatureUnit", "DegreeCelsius"): "°C",
+}
+
+_LOCATION_LABELS: dict[str, str] = {
+    "CentralLocation": "中控室 (DCS)",
+    "Field": "现场 (Field)",
+    "ControlPanel": "就地盘 (ControlPanel)",
+}
+
+_FAIL_ACTION_LABELS: dict[str, str] = {
+    "FailClose": "FC (故障关)",
+    "FC": "FC (故障关)",
+    "FailOpen": "FO (故障开)",
+    "FO": "FO (故障开)",
+    "FailRetainPosition": "FL (故障保位)",
+    "FL": "FL (故障保位)",
+}
+
+
+def _extract_physical_quantity(element: etree._Element, prop: str) -> tuple[float, str, str] | None:
+    """Parse ``Core/PhysicalQuantities.PhysicalQuantity`` into ``(value, unit_class, unit_leaf)``."""
+    data = element.find(f"Data[@property='{prop}']")
+    if data is None:
+        return None
+    agg = data.find("AggregatedDataValue[@type='Core/PhysicalQuantities.PhysicalQuantity']")
+    if agg is None:
+        return None
+    raw_val = data_value(agg, "Value")
+    if raw_val is None:
+        return None
+    try:
+        num = float(raw_val)
+    except ValueError:
+        return None
+    unit_ref = agg.find("Data[@property='Unit']/DataReference")
+    ref_str = (unit_ref.get("data") or "") if unit_ref is not None else ""
+    parts = [p for p in ref_str.split(".") if p]
+    unit_class = parts[-2] if len(parts) >= 2 else ""
+    unit_leaf = parts[-1] if parts else ""
+    return num, unit_class, unit_leaf
+
+
+def _format_physical_quantity(
+    val: float,
+    unit_class: str,
+    unit_leaf: str,
+    *,
+    include_barg_equiv: bool = False,
+) -> str:
+    """Format a DEXPI ``PhysicalQuantity`` for display (optionally including barg equivalent)."""
+    if include_barg_equiv and unit_class == "PressureGaugeUnit":
+        if unit_leaf == "Kilopascal":
+            barg = round(val / 100.0, 6)
+            sign = "+" if val > 0 else ""
+            return f"{sign}{val:g} kPa(g) ({barg:g} barg)"
+        if unit_leaf == "Bar" and abs(val) < 0.1 and val != 0:
+            kpa = round(val * 100.0, 6)
+            sign = "+" if val > 0 else ""
+            return f"{sign}{kpa:g} kPa(g) ({val:g} barg)"
+    unit_str = _PHYSICAL_QUANTITY_UNIT_LABELS.get((unit_class, unit_leaf), unit_leaf)
+    return f"{val:g} {unit_str}".strip()
+
+
+def _extract_data_text(element: etree._Element, prop: str) -> str | None:
+    """Read direct ``<Data property=prop>`` supporting strings, refs, PhysicalQuantity & MultiLanguageString."""
+    data = element.find(f"Data[@property='{prop}']")
+    if data is None:
+        return None
+    agg = data.find("AggregatedDataValue")
+    if agg is not None:
+        agg_type = agg.get("type") or ""
+        if agg_type == "Core/PhysicalQuantities.PhysicalQuantity":
+            pq = _extract_physical_quantity(element, prop)
+            return _format_physical_quantity(*pq) if pq is not None else None
+        if agg_type == "Core/DataTypes.MultiLanguageString":
+            candidates: list[tuple[str, str]] = []
+            for sls in agg.findall("Data[@property='SingleLanguageStrings']/AggregatedDataValue"):
+                lang = (data_value(sls, "Language") or "").strip().lower()
+                val_txt = (data_value(sls, "Value") or "").strip()
+                if val_txt:
+                    candidates.append((lang, val_txt))
+            for lang, val_txt in candidates:
+                if lang.startswith("zh"):
+                    return val_txt
+            return candidates[0][1] if candidates else None
+    return data_value(element, prop)
+
+
+def _xml_valve_actuator_info(sheet: Sheet, valve_el: etree._Element) -> tuple[str | None, str | None]:
+    """Read native fail action and actuator device type via ``OperatedValveReference`` -> ``ActuatingSystem``."""
+    fail_action: str | None = None
+    device_type: str | None = None
+    for ref_el in _referrers(sheet, valve_el, "Valve"):
+        act_sys = _ancestor_or_self(ref_el, "ActuatingSystem")
+        if act_sys is None:
+            continue
+        for act_el in _object_children(act_sys, "ControlledActuator"):
+            if not fail_action:
+                raw_fail = data_value(act_el, "FailAction") or data_value(act_el, "FailActionRepresentation")
+                if raw_fail:
+                    fail_action = _FAIL_ACTION_LABELS.get(raw_fail, raw_fail)
+            if not device_type:
+                device_type = data_value(act_el, "DeviceTypeName")
+        if fail_action and device_type:
+            break
+    return fail_action, device_type
+
+
+def _xml_chamber_summary(element: etree._Element) -> dict[str, str | None]:
+    """Summarize native DEXPI ``Chamber`` dimensions, material and design limits on equipment."""
+    dim_parts: list[str] = []
+    mats: list[str] = []
+    pressures: list[str] = []
+    temps: list[str] = []
+    descs: list[str] = []
+    for chamber in _object_children(element, "Chambers"):
+        c_dims: list[str] = []
+        dn_txt = _extract_data_text(chamber, "NominalDiameter") or _extract_data_text(chamber, "InsideDiameter")
+        if dn_txt:
+            c_dims.append(f"Ø{dn_txt}")
+        ln_txt = _extract_data_text(chamber, "Length")
+        ht_txt = _extract_data_text(chamber, "Height")
+        if ln_txt:
+            c_dims.append(f"L {ln_txt}")
+        elif ht_txt:
+            c_dims.append(f"H {ht_txt}")
+        if c_dims:
+            dim_parts.append(" × ".join(c_dims))
+        for val, bucket in (
+            (_extract_data_text(chamber, "MaterialOfConstructionCode"), mats),
+            (_extract_data_text(chamber, "UpperLimitDesignPressure"), pressures),
+            (_extract_data_text(chamber, "UpperLimitDesignTemperature"), temps),
+            (_extract_data_text(chamber, "ChamberDescription"), descs),
+        ):
+            if val and val not in bucket:
+                bucket.append(val)
+    return {
+        "dimensions": "; ".join(dim_parts) or None,
+        "material": ", ".join(mats) or None,
+        "design_pressure": ", ".join(pressures) or None,
+        "design_temperature": ", ".join(temps) or None,
+        "description": "; ".join(descs) or None,
+    }
+
+
 def _inspect_pid_object(
     sheet: Sheet,
     obj_id: str,
@@ -1109,7 +1263,7 @@ def _inspect_pid_object(
         prop = data_el.get("property") or ""
         if not prop:
             continue
-        val = data_value(element, prop)
+        val = _extract_data_text(element, prop)
         if val:
             attributes[prop] = val
 
@@ -1157,6 +1311,13 @@ def _inspect_pid_object(
     line_number: str | None = attributes.get("LineNumber")
     fluid_code: str | None = attributes.get("FluidCode")
     piping_class: str | None = attributes.get("PipingClassCode")
+    if not piping_class:
+        fin = attributes.get("FlowInPipingClassCode")
+        fout = attributes.get("FlowOutPipingClassCode")
+        if fin and fout and fin != fout:
+            piping_class = f"{fin} → {fout}"
+        elif fin or fout:
+            piping_class = fin or fout
     raw_dn: str | None = _extract_raw_dn(element)
     seg_id_val: str | None = seg_el.get("id") if seg_el is not None else None
 
@@ -1429,7 +1590,12 @@ def _inspect_pid_object(
         for comps in element.findall("Components"):
             for child in comps.findall("Object"):
                 c_cls = short_class(child)
-                if _is_nozzle(child) or c_cls == "PipingNode" or not child.get("id"):
+                if (
+                    _is_nozzle(child)
+                    or c_cls == "PipingNode"
+                    or (c_cls == "Chamber" and child.get("id") not in sheet.drawings)
+                    or not child.get("id")
+                ):
                     continue
                 parts.append(
                     {
@@ -1724,14 +1890,15 @@ def _inspect_pid_object(
     properties: list[dict[str, str | None]] = []
 
     if category == "equipment":
+        ch_info = _xml_chamber_summary(element)
         properties = [
             {"label": "位号", "key": "TagName", "value": tag or attributes.get("TagName")},
             {"label": "类型", "key": "DEXPI Class", "value": dexpi_class},
-            {"label": "名称/用途", "key": "service", "value": _from_ds("service")},
-            {"label": "设计压力", "key": "design_pressure_barg", "value": _from_ds("design_pressure_barg", "DesignPressure", "UpperLimitDesignPressure")},
-            {"label": "设计温度", "key": "design_temperature_degc", "value": _from_ds("design_temperature_degc", "DesignTemperature", "UpperLimitDesignTemperature")},
-            {"label": "材质", "key": "material", "value": _from_ds("material", "MaterialOfConstructionCode")},
-            {"label": "尺寸/容积", "key": "dimensions", "value": _from_ds("dimensions", "volume", "capacity", "NominalCapacity")},
+            {"label": "名称/用途", "key": "service", "value": attributes.get("EquipmentDescription") or _from_ds("service")},
+            {"label": "设计压力", "key": "design_pressure_barg", "value": attributes.get("UpperLimitDesignPressure") or ch_info["design_pressure"] or _from_ds("design_pressure_barg", "DesignPressure", "UpperLimitDesignPressure")},
+            {"label": "设计温度", "key": "design_temperature_degc", "value": attributes.get("UpperLimitDesignTemperature") or ch_info["design_temperature"] or _from_ds("design_temperature_degc", "DesignTemperature", "UpperLimitDesignTemperature")},
+            {"label": "材质", "key": "material", "value": attributes.get("MaterialOfConstructionCode") or ch_info["material"] or _from_ds("material", "MaterialOfConstructionCode")},
+            {"label": "尺寸/容积", "key": "dimensions", "value": ch_info["dimensions"] or _from_ds("dimensions", "volume", "capacity", "NominalCapacity")},
             {"label": "备注", "key": "notes", "value": _from_ds("notes")},
         ]
     elif category == "nozzle":
@@ -1787,15 +1954,14 @@ def _inspect_pid_object(
         ]
     elif category == "valve":
         notes_text = _from_ds("notes", "relief_case", "service")
-        if not fail_position:
-            fail_position = attributes.get("FailAction") or attributes.get("FailPosition")
+        xml_fail, xml_act_op = _xml_valve_actuator_info(sheet, element)
+        fail_position = xml_fail or fail_position or attributes.get("FailAction") or attributes.get("FailPosition")
         if not fail_position and notes_text:
             m_fail = _FAIL_POS_RE.search(notes_text)
             if m_fail:
                 code = m_fail.group(1)
-                fail_position = {"FC": "FC (故障关)", "FO": "FO (故障开)", "FL": "FL (故障保位)"}.get(code, code)
-        if not actuator_op:
-            actuator_op = attributes.get("Operation") or attributes.get("ActuatorType")
+                fail_position = _FAIL_ACTION_LABELS.get(code, code)
+        actuator_op = xml_act_op or actuator_op or attributes.get("Operation") or attributes.get("ActuatorType")
         if not actuator_op and notes_text:
             if "电磁" in notes_text:
                 actuator_op = "电磁驱动"
@@ -1821,15 +1987,25 @@ def _inspect_pid_object(
                 return f"{s} barg"
             return s
 
+        pq_high = _extract_physical_quantity(element, "SetPressureHigh")
+        pq_low = _extract_physical_quantity(element, "SetPressureLow")
         set_p = (
-            _format_set_pressure(li["set_pressure_barg"], True)
-            if li.get("set_pressure_barg") is not None
-            else _format_set_pressure(attributes.get("SetPressure") or ds.get("SetPressure"), False)
+            _format_physical_quantity(*pq_high, include_barg_equiv=True)
+            if pq_high is not None
+            else (
+                _format_set_pressure(li["set_pressure_barg"], True)
+                if li.get("set_pressure_barg") is not None
+                else _format_set_pressure(attributes.get("SetPressure") or ds.get("SetPressure"), False)
+            )
         )
         vac_p = (
-            _format_set_pressure(li["vacuum_set_pressure_barg"], True)
-            if li.get("vacuum_set_pressure_barg") is not None
-            else _format_set_pressure(attributes.get("VacuumSetPressure") or ds.get("VacuumSetPressure"), False)
+            _format_physical_quantity(*pq_low, include_barg_equiv=True)
+            if pq_low is not None
+            else (
+                _format_set_pressure(li["vacuum_set_pressure_barg"], True)
+                if li.get("vacuum_set_pressure_barg") is not None
+                else _format_set_pressure(attributes.get("VacuumSetPressure") or ds.get("VacuumSetPressure"), False)
+            )
         )
         pressure_rows = (
             [
@@ -1953,12 +2129,14 @@ def _inspect_pid_object(
         ) or None
         inst_num = attributes.get("ProcessInstrumentationFunctionNumber")
         alarms_and_il = "; ".join([*alarm_parts, *interlock_parts]) or None
+        raw_loc = attributes.get("Location") or _from_ds("location", "MountingLocation")
+        loc_display = _LOCATION_LABELS.get(raw_loc, raw_loc) if raw_loc else None
         properties = [
             {"label": "位号", "key": "Tag", "value": tag},
             {"label": "功能分类", "key": "Category", "value": cat_letters},
             {"label": "顺序号", "key": "Number", "value": inst_num},
             {"label": "测量/用途", "key": "service", "value": _from_ds("service")},
-            {"label": "安装位置", "key": "Location", "value": _from_ds("Location", "location", "MountingLocation")},
+            {"label": "安装位置", "key": "Location", "value": loc_display},
             {"label": "报警/联锁", "key": "Alarms / Interlock", "value": alarms_and_il},
             {"label": "所属回路", "key": "Loop", "value": ", ".join(loop_ids) if loop_ids else None},
         ]
