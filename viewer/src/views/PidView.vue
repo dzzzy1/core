@@ -80,7 +80,17 @@ watch(objectInfo.data, (info) => {
   }
 });
 const layers = computed(() => [{ id: "pid-layer", svg: svg.data.value }]);
-const css = computed(() => selectionCss("pid-layer", picked.value?.id ?? null));
+const css = computed(() => {
+  const info = objectInfo.data.value;
+  const pickedId = picked.value?.id ?? "";
+  const ids =
+    info && (info.id === pickedId || info.highlight_ids?.includes(pickedId)) && info.highlight_ids?.length
+      ? info.highlight_ids
+      : pickedId
+        ? [pickedId]
+        : [];
+  return ids.map((id) => selectionCss("pid-layer", id)).filter(Boolean).join("\n");
+});
 /**
  * `?select=<id>` (from the layout's "Open in P&ID"): pick and centre that object once drawn. A
  * printed tag (`?select=LIA-4107`, from the cause & effect matrix) picks the object drawn for it.

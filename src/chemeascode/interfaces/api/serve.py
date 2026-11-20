@@ -743,7 +743,7 @@ def _classify_pid_object(element: etree._Element) -> tuple[str, str]:
     if _is_nozzle(element):
         return "nozzle", "管口"
     if cls in ("PipingNetworkSystem", "PipingNetworkSegment", "Pipe"):
-        return "pipe", "管线" if cls == "PipingNetworkSystem" else "管段"
+        return "pipe", "管线" if cls == "PipingNetworkSystem" else "分支 (Branch)"
     if cls.endswith("Valve") or cls in ("ControlValve", "BreatherValve"):
         return "valve", "阀门"
     if el_type.startswith("Plant/Instrumentation.") or cls in (
@@ -1112,6 +1112,11 @@ _FAIL_ACTION_LABELS: dict[str, str] = {
     "FL": "FL (故障保位)",
 }
 
+_BRANCH_ROLE_LABELS: dict[str, str] = {
+    "PrimaryPipingNetworkSegment": "主管 (Primary)",
+    "SecondaryPipingNetworkSegment": "支管 (Secondary)",
+}
+
 
 def _extract_physical_quantity(element: etree._Element, prop: str) -> tuple[float, str, str] | None:
     """Parse ``Core/PhysicalQuantities.PhysicalQuantity`` into ``(value, unit_class, unit_leaf)``."""
@@ -1239,6 +1244,74 @@ def _xml_chamber_summary(element: etree._Element) -> dict[str, str | None]:
     }
 
 
+def _order_branch_segments(segs: list[etree._Element]) -> list[etree._Element]:
+    """Order sub-segments of one PDMS Branch monotonically from Head to Tail."""
+    if len(segs) <= 1:
+        return list(segs)
+    by_src: dict[str, list[etree._Element]] = {}
+    targets: set[str] = set()
+    for seg in segs:
+        refs = _references(seg)
+        src = refs.get("SourceItem")
+        dst = refs.get("TargetItem")
+        if src:
+            by_src.setdefault(src, []).append(seg)
+        if dst:
+            targets.add(dst)
+    start = next((s for s in segs if (_references(s).get("SourceItem") or "") not in targets), segs[0])
+    ordered: list[etree._Element] = []
+    seen: set[int] = set()
+    cur: etree._Element | None = start
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        ordered.append(cur)
+        cur_dst = _references(cur).get("TargetItem") or ""
+        nxt_list = by_src.get(cur_dst, ())
+        cur = next((s for s in nxt_list if id(s) not in seen), None)
+    for seg in segs:
+        if id(seg) not in seen:
+            seen.add(id(seg))
+            ordered.append(seg)
+    return ordered
+
+
+def _branch_segments_for(seg_el: etree._Element) -> tuple[str | None, list[etree._Element]]:
+    """Return ``(branch_number, ordered_sub_segments)`` for a ``PipingNetworkSegment``."""
+    seg_num = data_value(seg_el, "SegmentNumber")
+    sys_el = _ancestor_or_self(seg_el, "PipingNetworkSystem")
+    if seg_num and sys_el is not None:
+        siblings = [
+            s for s in _object_children(sys_el, "Segments")
+            if (data_value(s, "SegmentNumber") or "").strip() == seg_num.strip()
+        ]
+        if siblings:
+            return seg_num, _order_branch_segments(siblings)
+    return seg_num, [seg_el]
+
+
+def _group_system_branches(sys_el: etree._Element) -> list[tuple[str, list[etree._Element]]]:
+    """Group all segments of *sys_el* into ordered PDMS Branches keyed by ``SegmentNumber``."""
+    grouped: dict[str, list[etree._Element]] = {}
+    for seg in _object_children(sys_el, "Segments"):
+        key = (data_value(seg, "SegmentNumber") or seg.get("id") or "").strip()
+        grouped.setdefault(key, []).append(seg)
+    return [(key, _order_branch_segments(segs)) for key, segs in grouped.items()]
+
+
+def _branch_dn_display(segs: list[etree._Element]) -> tuple[str | None, str | None]:
+    """Return ``(raw_dn, formatted_dn)`` across ordered sub-segments (e.g. ``DN20 → DN32``)."""
+    distinct: list[str] = []
+    for seg in segs:
+        dn = _extract_raw_dn(seg)
+        if dn and dn not in distinct:
+            distinct.append(dn)
+    if not distinct:
+        return None, None
+    if len(distinct) == 1:
+        return distinct[0], _format_dn(distinct[0])
+    return " → ".join(distinct), " → ".join(_format_dn(d) or d for d in distinct)
+
+
 def _inspect_pid_object(
     sheet: Sheet,
     obj_id: str,
@@ -1319,7 +1392,11 @@ def _inspect_pid_object(
         elif fin or fout:
             piping_class = fin or fout
     raw_dn: str | None = _extract_raw_dn(element)
-    seg_id_val: str | None = seg_el.get("id") if seg_el is not None else None
+    seg_id_val: str | None = (
+        (data_value(seg_el, "SegmentNumber") or seg_el.get("id"))
+        if seg_el is not None
+        else None
+    )
 
     for anc in (seg_el, sys_el):
         if anc is None:
@@ -1553,6 +1630,8 @@ def _inspect_pid_object(
     outgoing_pipes, incoming_pipes = _pipe_graph(sheet)
     parts: list[dict[str, Any]] = []
     connections_list: list[dict[str, Any]] = []
+    highlight_ids: list[str] | None = None
+    branch_segs_for_self: list[etree._Element] = []
     seen_conn: set[tuple[str | None, str | None, str | None, str]] = set()
 
     def _add_conn(entry: dict[str, Any]) -> None:
@@ -1610,9 +1689,16 @@ def _inspect_pid_object(
         for c in _trace_nozzle_connections(sheet, piping, element, equip_el):
             _add_conn(c)
     elif dexpi_class == "PipingNetworkSegment":
-        seg_refs = _references(element)
-        for prop, direction in (("SourceItem", "in"), ("TargetItem", "out")):
-            tid = seg_refs.get(prop)
+        branch_num, branch_segs = _branch_segments_for(element)
+        branch_segs_for_self = branch_segs
+        branch_seg_set = set(branch_segs)
+        branch_ids = [s.get("id") for s in branch_segs if s.get("id")]
+        if len(branch_ids) > 1:
+            highlight_ids = branch_ids
+            attributes["SubSegments"] = ", ".join(branch_ids)
+        head_refs = _references(branch_segs[0])
+        tail_refs = _references(branch_segs[-1])
+        for tid, direction in ((head_refs.get("SourceItem"), "in"), (tail_refs.get("TargetItem"), "out")):
             if tid and tid in sheet.by_id:
                 target = sheet.by_id[tid]
                 oid, otag, ocls = _display_item(sheet, target)
@@ -1631,34 +1717,112 @@ def _inspect_pid_object(
                         "summary": f"{label_dir} {arrow} {otag or oid} ({ocls})",
                     }
                 )
-        for item in _ordered_segment_items(element):
-            iid = item.get("id") or ""
+        seen_part_ids: set[str] = set()
+        tee_ids: list[str] = []
+
+        def _append_branch_part(item_el: etree._Element) -> None:
+            iid = item_el.get("id") or ""
+            if not iid or iid in seen_part_ids:
+                return
+            seen_part_ids.add(iid)
+            i_cls = short_class(item_el)
             parts.append(
                 {
                     "id": iid,
-                    "class": short_class(item),
-                    "tag": _clean_tag(sheet.tag(item)) or iid,
-                    "dn": _extract_raw_dn(item),
+                    "class": i_cls,
+                    "tag": _clean_tag(sheet.tag(item_el)) or iid,
+                    "dn": _extract_raw_dn(item_el),
                     "connected_to": None,
                 }
             )
-    elif dexpi_class == "PipingNetworkSystem":
-        segs = _object_children(element, "Segments")
-        internal_ids: set[str] = set()
-        for seg in segs:
-            for item in _ordered_segment_items(seg):
-                iid = item.get("id") or ""
-                if iid:
-                    internal_ids.add(iid)
-                parts.append(
+            if i_cls in ("PipeTee", "PipeCross") and iid not in tee_ids:
+                tee_ids.append(iid)
+
+        for idx_b, sub_seg in enumerate(branch_segs):
+            for item in _ordered_segment_items(sub_seg):
+                _append_branch_part(item)
+            if idx_b < len(branch_segs) - 1:
+                mid_id = _references(sub_seg).get("TargetItem")
+                mid_el = sheet.by_id.get(mid_id or "")
+                if mid_el is not None:
+                    _append_branch_part(mid_el)
+
+        for sub_seg in branch_segs:
+            s_refs = _references(sub_seg)
+            for end_prop in ("SourceItem", "TargetItem"):
+                eid = s_refs.get(end_prop)
+                end_el = sheet.by_id.get(eid or "")
+                if end_el is not None and short_class(end_el) in ("PipeTee", "PipeCross") and eid and eid not in tee_ids:
+                    tee_ids.append(eid)
+
+        seen_peer_branches: set[tuple[str, str]] = set()
+        for tee_id in tee_ids:
+            tee_el = sheet.by_id.get(tee_id)
+            tee_cls = short_class(tee_el) if tee_el is not None else "PipeTee"
+            for other_seg in piping.ending_at.get(tee_id, []):
+                if other_seg in branch_seg_set:
+                    continue
+                o_bnum, o_bsegs = _branch_segments_for(other_seg)
+                o_id = (o_bsegs[0].get("id") if o_bsegs else other_seg.get("id")) or ""
+                if not o_id or (o_id, tee_id) in seen_peer_branches:
+                    continue
+                seen_peer_branches.add((o_id, tee_id))
+                o_tag = o_bnum or _clean_tag(sheet.tag(other_seg)) or o_id
+                _add_conn(
                     {
-                        "id": iid,
-                        "class": short_class(item),
-                        "tag": _clean_tag(sheet.tag(item)) or iid,
-                        "dn": _extract_raw_dn(item),
-                        "connected_to": seg.get("id"),
+                        "via_id": tee_id,
+                        "via_tag": tee_id,
+                        "via_class": tee_cls,
+                        "from_part": None,
+                        "other_id": o_id,
+                        "other_tag": o_tag,
+                        "other_class": "Branch",
+                        "direction": "peer",
+                        "summary": f"支管分支 ({tee_id}) ↔ {o_tag}",
                     }
                 )
+    elif dexpi_class == "PipingNetworkSystem":
+        grouped_branches = _group_system_branches(element)
+        segs = _object_children(element, "Segments")
+        internal_ids: set[str] = set()
+        for b_key, b_segs in grouped_branches:
+            b_rep = b_segs[0]
+            b_id = b_rep.get("id") or ""
+            h_refs = _references(b_segs[0])
+            t_refs = _references(b_segs[-1])
+            src_el = sheet.by_id.get(h_refs.get("SourceItem") or "")
+            tgt_el = sheet.by_id.get(t_refs.get("TargetItem") or "")
+            src_disp = (_display_item(sheet, src_el)[1] or src_el.get("id")) if src_el is not None else (h_refs.get("SourceItem") or "?")
+            tgt_disp = (_display_item(sheet, tgt_el)[1] or tgt_el.get("id")) if tgt_el is not None else (t_refs.get("TargetItem") or "?")
+            _, b_dn_fmt = _branch_dn_display(b_segs)
+            parts.append(
+                {
+                    "id": b_id,
+                    "class": "Branch",
+                    "tag": b_key,
+                    "dn": b_dn_fmt or _extract_raw_dn(b_rep),
+                    "connected_to": f"{src_disp} → {tgt_disp}",
+                }
+            )
+        seen_sys_items: set[str] = set()
+        for b_key, b_segs in grouped_branches:
+            for seg in b_segs:
+                for item in _ordered_segment_items(seg):
+                    iid = item.get("id") or ""
+                    if iid:
+                        internal_ids.add(iid)
+                    if not iid or iid in seen_sys_items:
+                        continue
+                    seen_sys_items.add(iid)
+                    parts.append(
+                        {
+                            "id": iid,
+                            "class": short_class(item),
+                            "tag": _clean_tag(sheet.tag(item)) or iid,
+                            "dn": _extract_raw_dn(item),
+                            "connected_to": b_key,
+                        }
+                    )
         for seg in segs:
             s_id = seg.get("id") or ""
             seg_refs = _references(seg)
@@ -1923,14 +2087,21 @@ def _inspect_pid_object(
         ]
     elif category == "pipe":
         seg_display = (
-            resolved_id
+            attributes.get("SegmentNumber") or resolved_id
             if dexpi_class == "PipingNetworkSegment"
             else (
-                f"{len(_object_children(element, 'Segments'))} 段"
+                f"{len(_group_system_branches(element))} 个分支"
                 if dexpi_class == "PipingNetworkSystem"
                 else None
             )
         )
+        if dexpi_class == "PipingNetworkSegment" and branch_segs_for_self:
+            br_raw_dn, br_fmt_dn = _branch_dn_display(branch_segs_for_self)
+            if br_fmt_dn:
+                dn_fmt = br_fmt_dn
+            if br_raw_dn:
+                attributes["NominalDiameter"] = br_raw_dn
+        seg_label = "分支号 (Branch)" if dexpi_class == "PipingNetworkSegment" else "包含分支 (Branch)"
         in_conns = [c["other_tag"] for c in connections_list if c["direction"] == "in" and c.get("other_tag")]
         out_conns = [c["other_tag"] for c in connections_list if c["direction"] == "out" and c.get("other_tag")]
         xml_from = ", ".join(dict.fromkeys(in_conns)) or None
@@ -1941,9 +2112,16 @@ def _inspect_pid_object(
         else:
             from_val = _str_val(li.get("from")) or xml_from
             to_val = _str_val(li.get("to")) or xml_to
+        raw_role = attributes.get("PrimarySecondaryPipingNetworkSegment")
+        role_row = (
+            [{"label": "分支类型", "key": "BranchRole", "value": _BRANCH_ROLE_LABELS.get(raw_role, raw_role) if raw_role else None}]
+            if dexpi_class == "PipingNetworkSegment"
+            else []
+        )
         properties = [
             {"label": "管线号", "key": "LineNumber", "value": line_number},
-            {"label": "管段号", "key": "Segment", "value": seg_display},
+            {"label": seg_label, "key": "Segment", "value": seg_display},
+            *role_row,
             {"label": "公称通径", "key": "DN", "value": dn_fmt},
             {"label": "介质", "key": "FluidCode", "value": fluid_code},
             {"label": "管道等级", "key": "PipingClassCode", "value": piping_class},
@@ -2036,13 +2214,14 @@ def _inspect_pid_object(
                     p = part.strip()
                     if p and p not in tee_dns:
                         tee_dns.append(p)
-            for _nb_id, seg, _sys_p in incoming_pipes.get(resolved_id, []) + outgoing_pipes.get(resolved_id, []):
-                seg_dn = _extract_raw_dn(seg)
-                if seg_dn:
-                    for part in re.split(r"[×xX/]", seg_dn):
-                        p = part.strip()
-                        if p and p not in tee_dns:
-                            tee_dns.append(p)
+            if not tee_dns:
+                for _nb_id, seg, _sys_p in incoming_pipes.get(resolved_id, []) + outgoing_pipes.get(resolved_id, []):
+                    seg_dn = _extract_raw_dn(seg)
+                    if seg_dn:
+                        for part in re.split(r"[×xX/]", seg_dn):
+                            p = part.strip()
+                            if p and p not in tee_dns:
+                                tee_dns.append(p)
             if tee_dns:
                 dn_fmt = " × ".join(p if p.upper().startswith("DN") else f"DN{p}" for p in tee_dns)
         properties = [
@@ -2207,6 +2386,7 @@ def _inspect_pid_object(
         "tag": tag,
         "owner": owner,
         "position": position,
+        "highlight_ids": highlight_ids,
         "attributes": attributes,
         "properties": properties,
         "list_info": list_info,

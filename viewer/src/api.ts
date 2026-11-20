@@ -3073,6 +3073,7 @@ export interface PidObjectInfo {
   tag: string | null;
   owner: PidObjectRef | null;
   position?: [number, number] | null;
+  highlight_ids?: string[] | null;
   attributes: Record<string, string>;
   properties: PidObjectProperty[];
   list_info: Record<string, unknown> | null;
