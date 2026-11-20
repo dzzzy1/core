@@ -14,6 +14,38 @@
     "c886f92fbd33f60b96d55cc6cb89798d8e0c04396b043fd82e67f2dd248cad99"
    ]
   },
+  "cad-import-equipment": {
+   "SKILL.md": [
+    "a97c5cb8771a8df0b80aef79dc635bb6136237b43644c0aed3ec96d5512b4354"
+   ]
+  },
+  "cad-import-instruments": {
+   "SKILL.md": [
+    "288305020804c6c1a3855e2b991d5e459c349c9556319ee81d106cc8842e2d60",
+    "4d24910506bb5dc99874bd2fdf3351b8fefdcb1f6b893a79dd93a1c1e281953e"
+   ]
+  },
+  "cad-import-orchestrator": {
+   "SKILL.md": [
+    "7620e57180281bb3dc84bbdbf1ac162da76c02ff1e19f6aaa74875a2848bf750"
+   ]
+  },
+  "cad-import-piping": {
+   "SKILL.md": [
+    "eb94f453b8ce55ae0ae5a131d04185f81138a4967c1f58cacc053ba50cf9fcdb"
+   ]
+  },
+  "cad-import-spec-breaks": {
+   "SKILL.md": [
+    "4e3b36eef52c5b49009ac5b3d459655fefcef80174a4ed94d55e08832fcb3d81",
+    "9e464f8c85bb57331f91aa9b725590ce446f5b751c382b91d4e6726d3730826d"
+   ]
+  },
+  "cad-import-valves-fittings": {
+   "SKILL.md": [
+    "592224faceff7fa2085d4962232581aa5546db7a7f6f0400f48c7ca5dee86c02"
+   ]
+  },
   "control-loops": {
    "SKILL.md": [
     "4bedf27266d050401d755e2c6b25ba1937a33bcfc06eaa099bb338cf190779f0",

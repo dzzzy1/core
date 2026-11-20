@@ -2553,6 +2553,7 @@ branch, tag or sha; absent: the working tree) and repo-relative POSIX `path`s:
 | `GET /api/tree?rev=` | `[{path, type, kind}]`, kind `pid`, `yaml`, `markdown`, `json` or `other` |
 | `GET /api/file?path=&rev=` | the file as text (400 for binary or over 5 MB) |
 | `GET /api/pid.svg?path=&rev=` | the sheet rendered, as `cheme render` draws it |
+| `GET /api/pid/object?path=&id=&rev=` | standard category properties, YAML list metadata, upstream/downstream connections, nozzles/inline parts, and spec-break / control records for one DEXPI object on a P&ID sheet |
 | `GET /api/diff?path=&old=HEAD&new=` | changes, both SVGs, highlight maps, `old_owner`/`new_owner` (changed id to drawn id), `status` (`added`/`removed` for a sheet on one side), review-text diff |
 | `GET /api/interlocks?rev=` | `{rev, file, interlocks, columns (effect tags), rows: [{id, title, cause, condition, sheet, sil, cells}]}`: the cause-and-effect list and matrix; 404 without `control/cause-effect.yaml` |
 | `GET /api/control` | the `cheme control report --json` report of the working tree: loops, sequences, the narrative and the control philosophy with their review status and findings; see docs/framework/control.md; 404 without control records, 422 when they do not load |

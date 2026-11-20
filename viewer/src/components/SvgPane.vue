@@ -151,7 +151,7 @@ onBeforeUnmount(() => styleEl.remove());
 
 // Pointer handling: drag pans, a press without movement picks, two pointers pinch-zoom.
 const pointers = new Map<number, { x: number; y: number }>();
-let start: { x: number; y: number; target: EventTarget | null } | null = null;
+let start: { x: number; y: number; clientX: number; clientY: number; target: EventTarget | null } | null = null;
 let moved = false;
 let pinch: { distance: number } | null = null;
 const dragging = ref(false);
@@ -167,7 +167,7 @@ function onPointerDown(event: PointerEvent): void {
   container.value?.setPointerCapture(event.pointerId);
   pointers.set(event.pointerId, local(event));
   if (pointers.size === 1) {
-    start = { ...local(event), target: event.target };
+    start = { ...local(event), clientX: event.clientX, clientY: event.clientY, target: event.target };
     moved = false;
   } else if (pointers.size === 2) {
     const [a, b] = [...pointers.values()];
@@ -202,7 +202,7 @@ function onPointerUp(event: PointerEvent): void {
   pointers.delete(event.pointerId);
   if (pointers.size < 2) pinch = null;
   if (pointers.size === 0) {
-    if (start && !moved) pick(start.target);
+    if (start && !moved) pick(start.target, start.clientX, start.clientY);
     start = null;
     dragging.value = false;
   }
@@ -254,12 +254,149 @@ function pickedOf(group: Element, layer: string): Picked {
   return { id: group.id, layer, className: group.getAttribute("class") ?? "", texts: texts.slice(0, 20) };
 }
 
-function pick(target: EventTarget | null): void {
+function isIgnoredGroup(el: Element | null): boolean {
+  if (!el) return true;
+  const id = el.id;
+  return !id || id === "SheetArtwork1" || id === "SheetBorder1" || id.startsWith("diagram-");
+}
+
+function pointToSegmentDist(px: number, py: number, x1: number, y1: number, x2: number, y2: number): number {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return Math.hypot(px - x1, py - y1);
+  const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / lenSq));
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
+/** Check whether `(cx, cy)` is within `tol` CSS pixels of any direct `<line>`/`<polyline>` segment of `group`. */
+function nearOwnWire(group: Element, cx: number, cy: number, tol: number): boolean {
+  const wires: Element[] = [];
+  for (const child of Array.from(group.children)) {
+    const tag = child.tagName.toLowerCase();
+    if (tag === "line" || tag === "polyline") wires.push(child);
+    else if (tag === "text") {
+      const r = child.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && cx >= r.left - tol && cx <= r.right + tol && cy >= r.top - tol && cy <= r.bottom + tol) {
+        return true;
+      }
+    }
+  }
+  if (!wires.length) return false;
+  for (const wire of wires) {
+    const gfx = wire as SVGGraphicsElement;
+    const ctm = typeof gfx.getScreenCTM === "function" ? gfx.getScreenCTM() : null;
+    if (!ctm) {
+      const r = wire.getBoundingClientRect();
+      if (cx >= r.left - tol && cx <= r.right + tol && cy >= r.top - tol && cy <= r.bottom + tol) return true;
+      continue;
+    }
+    const project = (x: number, y: number): [number, number] => [ctm.a * x + ctm.c * y + ctm.e, ctm.b * x + ctm.d * y + ctm.f];
+    if (wire.tagName.toLowerCase() === "line") {
+      const x1 = Number(wire.getAttribute("x1") ?? 0);
+      const y1 = Number(wire.getAttribute("y1") ?? 0);
+      const x2 = Number(wire.getAttribute("x2") ?? 0);
+      const y2 = Number(wire.getAttribute("y2") ?? 0);
+      const [sx1, sy1] = project(x1, y1);
+      const [sx2, sy2] = project(x2, y2);
+      if (pointToSegmentDist(cx, cy, sx1, sy1, sx2, sy2) <= tol) return true;
+    } else {
+      const raw = (wire.getAttribute("points") ?? "").trim();
+      const nums = raw.split(/[\s,]+/).map(Number).filter((n) => !Number.isNaN(n));
+      for (let i = 0; i + 3 < nums.length; i += 2) {
+        const [sx1, sy1] = project(nums[i]!, nums[i + 1]!);
+        const [sx2, sy2] = project(nums[i + 2]!, nums[i + 3]!);
+        if (pointToSegmentDist(cx, cy, sx1, sy1, sx2, sy2) <= tol) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function domDepth(el: Element): number {
+  let depth = 0;
+  let cur: Element | null = el;
+  while (cur) {
+    depth += 1;
+    cur = cur.parentElement;
+  }
+  return depth;
+}
+
+/**
+ * Find the smallest-area `g.representation-group[id]` inside `root` whose padded screen bounding
+ * box (`pad` px on each side) contains `(cx, cy)`. Makes hollow symbols (valves, bubbles,
+ * reducers, flanges) and thin 0.2 mm lines effortless to click without falsely matching huge
+ * L-shaped pipe containers on empty whitespace.
+ */
+function findSmallestMatchingGroup(root: Element, cx: number, cy: number, pad: number): Element | null {
+  let best: Element | null = null;
+  let bestArea = Number.POSITIVE_INFINITY;
+  let bestDepth = -1;
+  const candidates = root.querySelectorAll("g.representation-group[id]");
+  for (const cand of Array.from(candidates)) {
+    if (isIgnoredGroup(cand)) continue;
+    const rect = cand.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    if (cx < rect.left - pad || cx > rect.right + pad || cy < rect.top - pad || cy > rect.bottom + pad) continue;
+    // For large wire-only groups (e.g. L-shaped pipe runs or PipingNetworkSystem containers),
+    // require the click to actually lie near one of the group's own wire segments so clicking
+    // blank space inside an L-bend does not capture the pipe.
+    if (rect.width > 44 && rect.height > 44) {
+      let hasSolidBody = false;
+      let hasWire = false;
+      for (const ch of Array.from(cand.children)) {
+        const tag = ch.tagName.toLowerCase();
+        if (tag === "rect" || tag === "circle" || tag === "ellipse" || tag === "polygon" || tag === "path") {
+          hasSolidBody = true;
+          break;
+        }
+        if (tag === "line" || tag === "polyline") hasWire = true;
+      }
+      if (!hasSolidBody) {
+        if (hasWire) {
+          if (!nearOwnWire(cand, cx, cy, pad + 2)) continue;
+        } else if (cand.querySelector("g.representation-group[id]")) {
+          // Pure container group (e.g. PipingNetworkSystem) with no direct shapes of its own:
+          // let its child segments/items handle the click unless a direct text label was clicked.
+          const hasLabelHit = Array.from(cand.children).some((ch) => {
+            if (ch.tagName.toLowerCase() !== "text") return false;
+            const r = ch.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && cx >= r.left - pad && cx <= r.right + pad && cy >= r.top - pad && cy <= r.bottom + pad;
+          });
+          if (!hasLabelHit) continue;
+        }
+      }
+    }
+    const area = Math.max(rect.width, 1) * Math.max(rect.height, 1);
+    const depth = domDepth(cand);
+    if (area < bestArea || (area === bestArea && depth > bestDepth)) {
+      best = cand;
+      bestArea = area;
+      bestDepth = depth;
+    }
+  }
+  return best;
+}
+
+function pick(target: EventTarget | null, clientX?: number, clientY?: number): void {
   if (!pickable.value) return;
-  if (!(target instanceof Element)) return emitPick(null);
-  const layerEl = target.closest<HTMLElement>("[data-layer]");
-  let group = target.closest("g.representation-group[id]") ?? target.closest("g[id]");
-  if (group && group.id.startsWith("diagram-")) group = null;
+  const top = props.layers[props.layers.length - 1];
+  const topHost = top ? hosts.get(top.id) ?? null : null;
+  const layerEl = (target instanceof Element ? target.closest<HTMLElement>("[data-layer]") : null) ?? topHost;
+  let group = target instanceof Element ? (target.closest("g.representation-group[id]") ?? target.closest("g[id]")) : null;
+  if (isIgnoredGroup(group)) group = null;
+  if (layerEl && clientX !== undefined && clientY !== undefined) {
+    const PAD = 6;
+    if (!group) {
+      group = findSmallestMatchingGroup(layerEl, clientX, clientY, PAD);
+    } else {
+      // Even when clicking inside a parent container (equipment/line/segment), prefer a smaller
+      // nested representation-group (valve, fitting, nozzle) whose padded bbox covers the click.
+      const inner = findSmallestMatchingGroup(group, clientX, clientY, PAD);
+      if (inner) group = inner;
+    }
+  }
   if (!group || !layerEl) return emitPick(null);
   cursor.value = null;
   emitPick(pickedOf(group, layerEl.dataset.layer ?? ""));
@@ -398,6 +535,10 @@ const helpId = `${useId()}-help`;
   height: 100%;
 }
 .pickable .layer :deep(g[id]) {
+  cursor: pointer;
+}
+.pickable .layer :deep(svg g.representation-group) {
+  pointer-events: visiblePainted;
   cursor: pointer;
 }
 .caption {

@@ -46,11 +46,12 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import secrets
 import subprocess
 import tempfile
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
@@ -61,13 +62,31 @@ import yaml
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from lxml import etree
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException
 
 from chemeascode.domains.chemistry.catalysts import CATALYSTS_FILE, Catalysts
 from chemeascode.domains.chemistry.reactions import REACTIONS_FILE, Reactions
-from chemeascode.domains.piping.diffview import diff_sheet
+from chemeascode.domains.piping.diffview import _represented_by, diff_sheet
 from chemeascode.domains.piping.render import load_model, render_svg
+from chemeascode.domains.piping.show import (
+    Sheet,
+    _ancestor_or_self,
+    _equipment_of,
+    _functions_of,
+    _is_nozzle,
+    _loops,
+    _object_children,
+    _piping_index,
+    _references,
+    _referrers,
+    _targets,
+    data_value,
+    element_spans,
+    is_equipment,
+    short_class,
+)
 from chemeascode.domains.process import FLOWSHEET_FILE, MATERIALS_FILE
 from chemeascode.domains.process.schema import Flowsheet, Materials
 from chemeascode.domains.spatial.layout_validate import (
@@ -560,6 +579,1375 @@ def import_pydexpi() -> None:
         importlib.import_module(name)
 
 
+# ---------------------------------------------------------------------------
+# P&ID object inspection (GET /api/pid/object)
+# ---------------------------------------------------------------------------
+
+_DN_PROPS = ("NominalDiameterRepresentation", "NominalDiameterNumericalValueRepresentation")
+_CLASS_CODE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([A-Za-z])(\d*)$")
+_FAIL_POS_RE = re.compile(r"\b(FC|FO|FL|FCI|FOI)\b")
+
+
+def _sheet_from_bytes(content: bytes, name: str) -> Sheet:
+    """Parse DEXPI XML bytes into a :class:`Sheet` without touching disk."""
+    parser = etree.XMLParser(resolve_entities=False, no_network=True)
+    try:
+        root = etree.fromstring(content, parser)
+    except etree.XMLSyntaxError as failure:
+        raise ApiError(422, f"{name}: not well-formed XML: {_first_line(failure)}") from failure
+    elements = [e for e in root.iter() if isinstance(e.tag, str)]
+    spans = element_spans(content)
+    if len(spans) != len(elements):
+        spans = [(e.sourceline or 0, e.sourceline or 0) for e in elements]
+    sheet = Sheet(name, root, dict(zip(elements, spans, strict=True)))
+    for element in elements:
+        if element.tag == "Object" and element.get("id"):
+            sheet.by_id.setdefault(element.get("id"), element)
+        if element.tag == "References":
+            holder = element.getparent()
+            prop = element.get("property", "")
+            for target in element.get("objects", "").split():
+                target = target.lstrip("#")
+                if prop == "Represents":
+                    sheet.drawings.setdefault(target, []).append(holder)
+                else:
+                    sheet.incoming.setdefault(target, []).append((element, prop))
+    sheet.owner = _represented_by(root)[1]
+    return sheet
+
+
+def _clean_tag(tag: str | None) -> str | None:
+    if not tag:
+        return None
+    text = tag.strip()
+    if not text or text.startswith("A$"):
+        return None
+    return text
+
+
+def _norm_tag(text: str) -> str:
+    return re.sub(r"[\s\-_]", "", text).upper()
+
+
+def _derive_piping_class(code: str | None) -> tuple[str | None, str | None]:
+    """Derive ``(nominal_pressure, material_group)`` from a piping class code.
+
+    Example: ``1.6A3`` -> ``("PN16", "PN16 / A系")``, ``2.5K2`` -> ``("PN25", "PN25 / K系")``.
+    """
+    if not code:
+        return None, None
+    text = code.strip()
+    m = _CLASS_CODE_RE.match(text)
+    if m:
+        mpa = float(m.group(1))
+        pn = mpa * 10.0
+        pn_str = f"PN{int(pn)}" if pn.is_integer() else f"PN{pn:g}"
+        letter = m.group(2).upper()
+        return pn_str, f"{pn_str} / {letter}系"
+    m_pn = re.match(r"^(PN\s*\d+(?:\.\d+)?)\b", text, re.IGNORECASE)
+    if m_pn:
+        pn_str = m_pn.group(1).upper().replace(" ", "")
+        return pn_str, pn_str
+    return None, None
+
+
+_MATERIAL_SERIES_RANK = {"A": 1, "B": 2, "C": 3, "D": 3, "E": 4, "K": 5, "L": 5, "S": 5}
+
+
+def _piping_class_rank(code: str) -> tuple[float, int]:
+    """Rank piping class codes by nominal pressure (MPa), breaking ties by corrosion series (K > A)."""
+    m = _CLASS_CODE_RE.match(code.strip())
+    if not m:
+        return (0.0, 0)
+    return (float(m.group(1)), _MATERIAL_SERIES_RANK.get(m.group(2).upper(), 0))
+
+
+def _lookup_pipe_spec_material(lists: dict[str, dict[str, Any]] | None, piping_class: str | None) -> str | None:
+    """Resolve non-empty material text for ``piping_class`` from ``piping/pipe-specs.yaml``."""
+    if not lists or not piping_class:
+        return None
+    target = piping_class.strip().upper()
+    classes = (lists.get("pipe_specs") or {}).get("classes") or []
+    for entry in classes:
+        if isinstance(entry, dict) and str(entry.get("code") or "").strip().upper() == target:
+            mat = entry.get("material")
+            if isinstance(mat, str) and mat.strip():
+                return mat.strip()
+    return None
+
+
+def _extract_raw_dn(element: etree._Element) -> str | None:
+    for prop in _DN_PROPS:
+        val = data_value(element, prop)
+        if val:
+            return val
+    node_dns: list[str] = []
+    for node in _object_children(element, "Nodes"):
+        for prop in _DN_PROPS:
+            val = data_value(node, prop)
+            if val:
+                if val not in node_dns:
+                    node_dns.append(val)
+                break
+    if not node_dns:
+        return None
+    if len(node_dns) == 1:
+        return node_dns[0]
+    return "×".join(node_dns)
+
+
+def _format_dn(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    parts = [p.strip() for p in re.split(r"[×xX/]", raw) if p.strip()]
+    if not parts:
+        return None
+    formatted = [p if p.upper().startswith("DN") else f"DN{p}" for p in parts]
+    return "×".join(formatted)
+
+
+def _resolve_pid_element(sheet: Sheet, obj_id: str) -> etree._Element:
+    """Resolve an XML object id or RepresentationGroup/label id to its conceptual element."""
+    element = sheet.by_id.get(obj_id)
+    if element is None:
+        found = sheet.find(obj_id)
+        if not found:
+            raise ApiError(404, f"object {obj_id!r} not found in {sheet.name}")
+        element = found[0]
+    for _ in range(3):
+        el_type = element.get("type", "")
+        if not el_type.startswith(("Core/Diagram.", "Plant/Diagram.")):
+            break
+        refs = _references(element)
+        next_id = refs.get("Represents") or refs.get("Object") or refs.get("Node")
+        if next_id and next_id in sheet.by_id and sheet.by_id[next_id] is not element:
+            element = sheet.by_id[next_id]
+        else:
+            break
+    return element
+
+
+def _classify_pid_object(element: etree._Element) -> tuple[str, str]:
+    obj_id = element.get("id") or ""
+    cls = short_class(element)
+    el_type = element.get("type", "")
+    if (
+        obj_id.startswith("SB_")
+        or "SpecBreak" in cls
+        or "PropertyBreak" in cls
+        or "PipingClassBreak" in cls
+    ):
+        return "spec_break", "规格分界"
+    if is_equipment(element):
+        return "equipment", "设备"
+    if _is_nozzle(element):
+        return "nozzle", "管口"
+    if cls in ("PipingNetworkSystem", "PipingNetworkSegment", "Pipe"):
+        return "pipe", "管线" if cls == "PipingNetworkSystem" else "管段"
+    if cls.endswith("Valve") or cls in ("ControlValve", "BreatherValve"):
+        return "valve", "阀门"
+    if el_type.startswith("Plant/Instrumentation.") or cls in (
+        "ProcessInstrumentationFunction",
+        "InstrumentationLoopFunction",
+        "ProcessSignalGeneratingFunction",
+        "SignalConveyingFunction",
+        "SignalLineFunction",
+        "MeasuringLineFunction",
+        "ActuatingFunction",
+        "ActuatingSystem",
+    ):
+        return "instrument", "仪表"
+    if cls.endswith("OffPageConnector"):
+        return "connector", "跨页连接"
+    if el_type.startswith("Plant/Piping."):
+        return "fitting", "管件/特殊件"
+    return "other", "对象"
+
+
+def _pipe_graph(
+    sheet: Sheet,
+) -> tuple[
+    dict[str, list[tuple[str, etree._Element, etree._Element | None]]],
+    dict[str, list[tuple[str, etree._Element, etree._Element | None]]],
+]:
+    """Directed adjacency from all ``Pipe`` connections (falling back to segment ends)."""
+    outgoing: dict[str, list[tuple[str, etree._Element, etree._Element | None]]] = {}
+    incoming: dict[str, list[tuple[str, etree._Element, etree._Element | None]]] = {}
+    for seg in sheet.root.iter("Object"):
+        if short_class(seg) != "PipingNetworkSegment":
+            continue
+        sys_el = _ancestor_or_self(seg, "PipingNetworkSystem")
+        pipes = _object_children(seg, "Connections")
+        holders = pipes if pipes else [seg]
+        for holder in holders:
+            refs = _references(holder)
+            src = refs.get("SourceItem")
+            dst = refs.get("TargetItem")
+            if src and dst and src != dst:
+                outgoing.setdefault(src, []).append((dst, seg, sys_el))
+                incoming.setdefault(dst, []).append((src, seg, sys_el))
+    return outgoing, incoming
+
+
+def _ordered_segment_items(segment: etree._Element) -> list[etree._Element]:
+    """Inline items of *segment* ordered along its ``Pipe`` chain from SourceItem."""
+    items = _object_children(segment, "Items")
+    if len(items) <= 1:
+        return items
+    by_id = {item.get("id"): item for item in items if item.get("id")}
+    adj: dict[str, list[str]] = {}
+    for pipe in _object_children(segment, "Connections"):
+        refs = _references(pipe)
+        src, dst = refs.get("SourceItem"), refs.get("TargetItem")
+        if src and dst:
+            adj.setdefault(src, []).append(dst)
+    ordered: list[etree._Element] = []
+    seen: set[str] = set()
+    start = _references(segment).get("SourceItem")
+    queue: deque[str] = deque([start] if start else [])
+    visited: set[str] = set()
+    while queue:
+        cur = queue.popleft()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        if cur in by_id and cur not in seen:
+            seen.add(cur)
+            ordered.append(by_id[cur])
+        for nxt in adj.get(cur, ()):
+            if nxt not in visited:
+                queue.append(nxt)
+    for item in items:
+        iid = item.get("id")
+        if iid and iid not in seen:
+            seen.add(iid)
+            ordered.append(item)
+    return ordered
+
+
+def _display_item(sheet: Sheet, element: etree._Element) -> tuple[str, str | None, str]:
+    """Return ``(id, display_tag, class_name)`` for a referenced item."""
+    el_id = element.get("id") or ""
+    cls = short_class(element)
+    if _is_nozzle(element):
+        equip = _equipment_of(element)
+        noz_tag = _clean_tag(sheet.tag(element)) or el_id
+        if equip is not None and equip is not element:
+            eq_tag = _clean_tag(sheet.tag(equip)) or equip.get("id") or ""
+            return el_id, f"{eq_tag}:{noz_tag}", cls
+        return el_id, noz_tag, cls
+    tag = _clean_tag(sheet.tag(element))
+    if not tag and cls.endswith("OffPageConnector"):
+        tag = data_value(element, "PipeConnectorNumber") or el_id
+    return el_id, tag, cls
+
+
+def _trace_nozzle_connections(
+    sheet: Sheet,
+    piping: Any,
+    nozzle: etree._Element,
+    equip: etree._Element | None,
+) -> list[dict[str, Any]]:
+    """Trace every segment attached to *nozzle* to its far-end equipment/OPC/tee."""
+    noz_id = nozzle.get("id") or ""
+    noz_tag = _clean_tag(sheet.tag(nozzle)) or noz_id
+    attached = piping.ending_at.get(noz_id, [])
+    results: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str | None, str | None, str | None, str]] = set()
+
+    def _add(entry: dict[str, Any]) -> None:
+        key = (entry["from_part"], entry["via_tag"], entry["other_id"], entry["direction"])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            results.append(entry)
+
+    for seg in attached:
+        seg_id = seg.get("id") or ""
+        sys_el = _ancestor_or_self(seg, "PipingNetworkSystem")
+        via_tag = _clean_tag(sheet.tag(sys_el)) if sys_el is not None else seg_id
+        seg_refs = _references(seg)
+        if seg_refs.get("SourceItem") == noz_id:
+            direction = "out"
+        elif seg_refs.get("TargetItem") == noz_id:
+            direction = "in"
+        else:
+            direction = "peer"
+
+        # BFS along segments belonging to the same PipingNetworkSystem to find far ends.
+        reached: list[tuple[etree._Element, str]] = []
+        visited_segs: set[etree._Element] = {seg}
+        queue: deque[etree._Element] = deque([seg])
+        while queue:
+            cur_seg = queue.popleft()
+            # Inspect segment ends and items inside this segment.
+            end_ids: list[str] = []
+            for prop in ("SourceItem", "TargetItem"):
+                for ref in cur_seg.findall(f"References[@property='{prop}']"):
+                    for t in ref.get("objects", "").split():
+                        tid = t.lstrip("#")
+                        if tid and tid not in end_ids:
+                            end_ids.append(tid)
+            for item in _object_children(cur_seg, "Items"):
+                iid = item.get("id")
+                if iid and iid not in end_ids:
+                    end_ids.append(iid)
+            for tid in end_ids:
+                if tid == noz_id:
+                    continue
+                target = sheet.by_id.get(tid)
+                if target is None:
+                    continue
+                t_cls = short_class(target)
+                t_equip = _equipment_of(target)
+                if t_equip is not None:
+                    if equip is not None and t_equip is equip:
+                        if _is_nozzle(target) and tid != noz_id:
+                            reached.append((target, "peer"))
+                    else:
+                        reached.append((target, direction))
+                    continue
+                if t_cls.endswith("OffPageConnector"):
+                    reached.append((target, direction))
+                    continue
+                # Follow connected segments in the same PipingNetworkSystem (via tees/shared items)
+                other_segs = [
+                    s
+                    for s in piping.ending_at.get(tid, [])
+                    if s not in visited_segs
+                    and (sys_el is None or _ancestor_or_self(s, "PipingNetworkSystem") is sys_el)
+                ]
+                holder = piping.segment_of.get(tid)
+                if (
+                    holder is not None
+                    and holder not in visited_segs
+                    and (sys_el is None or _ancestor_or_self(holder, "PipingNetworkSystem") is sys_el)
+                ):
+                    other_segs.append(holder)
+                if other_segs:
+                    for nxt in other_segs:
+                        visited_segs.add(nxt)
+                        queue.append(nxt)
+                elif (
+                    holder is not None
+                    and holder is not cur_seg
+                    and (sys_el is None or _ancestor_or_self(holder, "PipingNetworkSystem") is not sys_el)
+                ):
+                    # Reached a tee / junction belonging to a different PipingNetworkSystem
+                    reached.append((target, direction))
+
+        if reached:
+            for target, eff_dir in reached:
+                t_equip = _equipment_of(target)
+                if t_equip is not None and (equip is None or t_equip is not equip):
+                    other_id = t_equip.get("id") or ""
+                    other_tag = _clean_tag(sheet.tag(t_equip)) or other_id
+                    other_cls = short_class(t_equip)
+                    target_noz = _clean_tag(sheet.tag(target)) if _is_nozzle(target) else None
+                    target_label = f"{other_tag}:{target_noz}" if target_noz else other_tag
+                else:
+                    other_id, other_tag, other_cls = _display_item(sheet, target)
+                    target_label = other_tag or other_id
+                arrow = "→" if eff_dir == "out" else ("←" if eff_dir == "in" else "↔")
+                _add(
+                    {
+                        "via_id": seg_id,
+                        "via_tag": via_tag,
+                        "via_class": "PipingNetworkSegment",
+                        "from_part": noz_tag,
+                        "other_id": other_id,
+                        "other_tag": other_tag or other_id,
+                        "other_class": other_cls,
+                        "direction": eff_dir,
+                        "summary": f"{noz_tag} {arrow} {via_tag} {arrow} {target_label}",
+                    }
+                )
+        else:
+            # Fallback to the segment's direct opposite end
+            opp_ids = [
+                seg_refs.get(p)
+                for p in ("SourceItem", "TargetItem")
+                if seg_refs.get(p) and seg_refs.get(p) != noz_id
+            ]
+            for opp_id in opp_ids:
+                opp = sheet.by_id.get(opp_id or "")
+                if opp is None:
+                    continue
+                other_id, other_tag, other_cls = _display_item(sheet, opp)
+                arrow = "→" if direction == "out" else ("←" if direction == "in" else "↔")
+                _add(
+                    {
+                        "via_id": seg_id,
+                        "via_tag": via_tag,
+                        "via_class": "PipingNetworkSegment",
+                        "from_part": noz_tag,
+                        "other_id": other_id,
+                        "other_tag": other_tag or other_id,
+                        "other_class": other_cls,
+                        "direction": direction,
+                        "summary": f"{noz_tag} {arrow} {via_tag} {arrow} {other_tag or other_id}",
+                    }
+                )
+
+    # Also instruments sensing this nozzle directly in XML
+    for gen in _referrers(sheet, nozzle, "SensingLocation"):
+        fn = _ancestor_or_self(gen, "ProcessInstrumentationFunction") or gen
+        fn_id = fn.get("id") or ""
+        fn_tag = _clean_tag(sheet.tag(fn)) or fn_id
+        _add(
+            {
+                "via_id": None,
+                "via_tag": "SensingLocation",
+                "via_class": "Instrumentation",
+                "from_part": noz_tag,
+                "other_id": fn_id,
+                "other_tag": fn_tag,
+                "other_class": short_class(fn),
+                "direction": "peer",
+                "summary": f"{noz_tag} ↔ 测点 {fn_tag}",
+            }
+        )
+    return results
+
+
+def _safe_yaml_dict(snapshot: Snapshot, small_fn: Callable[[Snapshot, str], Any], path: str) -> dict[str, Any]:
+    try:
+        found = small_fn(snapshot, path)
+    except ApiError:
+        return {}
+    if found is None:
+        return {}
+    try:
+        raw = yaml.safe_load(found[0])
+        if not isinstance(raw, dict):
+            return {}
+        return json_safe(raw)
+    except (yaml.YAMLError, ApiError):
+        return {}
+
+
+def _match_entry(items: list[Any], key_field: str, candidates: list[str]) -> dict[str, Any] | None:
+    if not candidates or not items:
+        return None
+    exact_set = {c.strip() for c in candidates if c}
+    norm_set = {_norm_tag(c) for c in candidates if c}
+    for item in items:
+        if isinstance(item, dict):
+            val = str(item.get(key_field, "") or "").strip()
+            if val and val in exact_set:
+                return dict(item)
+    for item in items:
+        if isinstance(item, dict):
+            val = str(item.get(key_field, "") or "").strip()
+            if val and _norm_tag(val) in norm_set:
+                return dict(item)
+    return None
+
+
+def _tag_in_text(tag: str, text: str) -> bool:
+    if not tag or not text:
+        return False
+    return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(tag)}(?![A-Za-z0-9])", text))
+
+
+def _str_val(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (int, float)):
+        return f"{value:g}"
+    if isinstance(value, dict):
+        if "value" in value:
+            unit = value.get("unit") or ""
+            return f"{value['value']} {unit}".strip()
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _inspect_pid_object(
+    sheet: Sheet,
+    obj_id: str,
+    lists: dict[str, dict[str, Any]],
+    datasheet: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the rich inspection payload for ``GET /api/pid/object``."""
+    element = _resolve_pid_element(sheet, obj_id)
+    resolved_id = element.get("id") or obj_id
+    dexpi_class = short_class(element)
+    category, category_label = _classify_pid_object(element)
+
+    raw_tags = sheet.tags(element)
+    clean_tags = [t for t in (_clean_tag(x) for x in raw_tags) if t]
+    tag = clean_tags[0] if clean_tags else None
+    if not tag and dexpi_class.endswith("OffPageConnector"):
+        tag = data_value(element, "PipeConnectorNumber")
+
+    # Direct XML attributes
+    attributes: dict[str, str] = {}
+    for data_el in element.findall("Data"):
+        prop = data_el.get("property") or ""
+        if not prop:
+            continue
+        val = data_value(element, prop)
+        if val:
+            attributes[prop] = val
+
+    # Ancestor / owner resolution
+    seg_el = (
+        element
+        if dexpi_class == "PipingNetworkSegment"
+        else _ancestor_or_self(element, "PipingNetworkSegment")
+    )
+    sys_el = (
+        element
+        if dexpi_class == "PipingNetworkSystem"
+        else _ancestor_or_self(element, "PipingNetworkSystem")
+    )
+    equip_el = _equipment_of(element) if _is_nozzle(element) else None
+
+    owner_el: etree._Element | None = None
+    if _is_nozzle(element) and equip_el is not None and equip_el is not element:
+        owner_el = equip_el
+    elif dexpi_class == "PipingNetworkSegment" and sys_el is not None and sys_el is not element:
+        owner_el = sys_el
+    elif category in ("valve", "fitting", "connector", "spec_break"):
+        if sys_el is not None and sys_el is not element:
+            owner_el = sys_el
+        elif seg_el is not None and seg_el is not element:
+            owner_el = seg_el
+    else:
+        for anc in element.iterancestors("Object"):
+            anc_cls = short_class(anc)
+            if anc_cls not in ("PlantModel", "EngineeringModel"):
+                owner_el = anc
+                break
+
+    owner = (
+        {
+            "id": owner_el.get("id") or "",
+            "class": short_class(owner_el),
+            "tag": _clean_tag(sheet.tag(owner_el)),
+        }
+        if owner_el is not None and owner_el.get("id")
+        else None
+    )
+
+    # Inherit line/segment piping metadata when applicable
+    line_number: str | None = attributes.get("LineNumber")
+    fluid_code: str | None = attributes.get("FluidCode")
+    piping_class: str | None = attributes.get("PipingClassCode")
+    raw_dn: str | None = _extract_raw_dn(element)
+    seg_id_val: str | None = seg_el.get("id") if seg_el is not None else None
+
+    for anc in (seg_el, sys_el):
+        if anc is None:
+            continue
+        if not line_number:
+            line_number = data_value(anc, "LineNumber")
+        if not fluid_code:
+            fluid_code = data_value(anc, "FluidCode")
+        if not piping_class:
+            piping_class = data_value(anc, "PipingClassCode")
+        if not raw_dn:
+            raw_dn = _extract_raw_dn(anc)
+
+    if line_number:
+        attributes.setdefault("LineNumber", line_number)
+    if fluid_code:
+        attributes.setdefault("FluidCode", fluid_code)
+    if piping_class:
+        attributes.setdefault("PipingClassCode", piping_class)
+    if raw_dn:
+        attributes["NominalDiameter"] = raw_dn
+    if seg_id_val and category in ("valve", "fitting", "connector", "pipe"):
+        attributes.setdefault("Segment", seg_id_val)
+
+    # Match YAML lists (equipment-list, line-list, special-items, instrument-list)
+    eq_list = lists.get("equipment", {}).get("equipment") or []
+    line_list = lists.get("lines", {}).get("lines") or []
+    sp_list = lists.get("piping_items", {}).get("piping_items") or []
+    inst_list = lists.get("instruments", {}).get("instruments") or []
+
+    tag_candidates = list(dict.fromkeys([*clean_tags, *(t for t in (tag, line_number) if t)]))
+    list_info: dict[str, Any] | None = None
+    if category == "equipment":
+        list_info = _match_entry(eq_list, "tag", clean_tags)
+    elif category == "pipe":
+        line_cands = [c for c in (line_number, tag) if c]
+        list_info = _match_entry(line_list, "number", line_cands)
+    elif category == "instrument":
+        inst_hit = _match_entry(inst_list, "tag", clean_tags)
+        sp_hit = _match_entry(sp_list, "tag", clean_tags)
+        if inst_hit or sp_hit:
+            list_info = {**(sp_hit or {}), **(inst_hit or {})}
+    elif category in ("valve", "fitting"):
+        sp_hit = _match_entry(sp_list, "tag", clean_tags)
+        inst_hit = _match_entry(inst_list, "tag", clean_tags)
+        if sp_hit or inst_hit:
+            list_info = {**(inst_hit or {}), **(sp_hit or {})}
+    else:
+        list_info = (
+            _match_entry(eq_list, "tag", clean_tags)
+            or _match_entry(sp_list, "tag", clean_tags)
+            or _match_entry(inst_list, "tag", clean_tags)
+            or _match_entry(line_list, "number", tag_candidates)
+        )
+
+    if list_info:
+        if not line_number and list_info.get("line"):
+            line_number = str(list_info["line"])
+            attributes.setdefault("LineNumber", line_number)
+        if not piping_class and list_info.get("pressure_class"):
+            piping_class = str(list_info["pressure_class"])
+            attributes.setdefault("PipingClassCode", piping_class)
+        if not fluid_code and list_info.get("fluid"):
+            fluid_code = str(list_info["fluid"])
+            attributes.setdefault("FluidCode", fluid_code)
+        if not raw_dn and list_info.get("nominal_diameter"):
+            raw_dn = str(list_info["nominal_diameter"])
+            attributes.setdefault("NominalDiameter", raw_dn)
+
+    # Controls & interlocks matching (control/loops.yaml & control/cause-effect.yaml)
+    loops_raw = lists.get("loops", {}).get("loops") or []
+    interlocks_raw = lists.get("interlocks", {}).get("interlocks") or []
+    controls: list[dict[str, Any]] = []
+    control_peer_tags: list[tuple[str, str, str]] = []  # (other_tag, direction, summary_prefix)
+    loop_ids: list[str] = []
+    alarm_parts: list[str] = []
+    interlock_parts: list[str] = []
+    fail_position: str | None = None
+    actuator_op: str | None = None
+
+    norm_self_tags = {_norm_tag(t) for t in clean_tags}
+
+    for lp in loops_raw:
+        if not isinstance(lp, dict):
+            continue
+        lp_id = str(lp.get("id") or "")
+        lp_title = str(lp.get("title") or "")
+        lp_purpose = str(lp.get("purpose") or "")
+        ctrl_tag = str(lp.get("controller") or "")
+        meas_tags = [str(m.get("tag") or "") for m in (lp.get("measurement") or []) if isinstance(m, dict) and m.get("tag")]
+        fe_items = [fe for fe in (lp.get("final_elements") or []) if isinstance(fe, dict) and fe.get("tag")]
+        fe_tags = [str(fe["tag"]) for fe in fe_items]
+        al_items = [a for a in (lp.get("alarms") or []) if isinstance(a, dict)]
+        al_tags = [str(a.get("tag") or "") for a in al_items if a.get("tag")]
+
+        all_lp_tags = [t for t in [lp_id, ctrl_tag, *meas_tags, *fe_tags, *al_tags] if t]
+        matched = any(_norm_tag(t) in norm_self_tags for t in all_lp_tags)
+        if not matched and category == "equipment" and tag:
+            matched = _tag_in_text(tag, lp_title) or _tag_in_text(tag, lp_purpose)
+        if not matched:
+            continue
+
+        if lp_id and lp_id not in loop_ids:
+            loop_ids.append(lp_id)
+        detail_bits: list[str] = []
+        if meas_tags:
+            detail_bits.append(f"测量: {', '.join(meas_tags)}")
+        if ctrl_tag:
+            act = f" ({lp['action']})" if lp.get("action") else ""
+            detail_bits.append(f"控制: {ctrl_tag}{act}")
+        if fe_items:
+            fe_strs = []
+            for fe in fe_items:
+                f_str = str(fe["tag"])
+                if fe.get("fail"):
+                    f_str += f" ({'FC' if fe['fail'] == 'closed' else 'FO' if fe['fail'] == 'open' else fe['fail']})"
+                fe_strs.append(f_str)
+                if _norm_tag(str(fe["tag"])) in norm_self_tags:
+                    if fe.get("fail") and not fail_position:
+                        fail_position = (
+                            "FC (故障关)"
+                            if fe["fail"] == "closed"
+                            else "FO (故障开)"
+                            if fe["fail"] == "open"
+                            else str(fe["fail"])
+                        )
+                    if fe.get("actuator") and not actuator_op:
+                        act_map = {"pneumatic": "气动 (pneumatic)", "electric": "电动 (electric)", "hydraulic": "液动 (hydraulic)"}
+                        actuator_op = act_map.get(str(fe["actuator"]), str(fe["actuator"]))
+            detail_bits.append(f"执行: {', '.join(fe_strs)}")
+        if al_items:
+            al_strs = []
+            for a in al_items:
+                cond = str(a.get("condition") or "")
+                lim = a.get("limit")
+                lim_s = _str_val(lim) if lim else None
+                entry_s = f"{cond} {lim_s}".strip() if cond or lim_s else ""
+                if entry_s:
+                    al_strs.append(entry_s)
+                    if not a.get("tag") or _norm_tag(str(a["tag"])) in norm_self_tags:
+                        if entry_s not in alarm_parts:
+                            alarm_parts.append(entry_s)
+            if al_strs:
+                detail_bits.append(f"报警: {', '.join(al_strs)}")
+        controls.append(
+            {
+                "kind": "loop",
+                "id": lp_id or ctrl_tag or "Loop",
+                "title": lp_title or lp_purpose,
+                "detail": " | ".join(detail_bits),
+            }
+        )
+        # Clickable loop connections for instruments & final elements
+        if category in ("instrument", "valve"):
+            if ctrl_tag and _norm_tag(ctrl_tag) in norm_self_tags:
+                for mt in meas_tags:
+                    if _norm_tag(mt) not in norm_self_tags:
+                        control_peer_tags.append((mt, "in", f"回路 {lp_id} 测量"))
+                for ft in fe_tags:
+                    if _norm_tag(ft) not in norm_self_tags:
+                        control_peer_tags.append((ft, "out", f"回路 {lp_id} 执行"))
+            elif any(_norm_tag(mt) in norm_self_tags for mt in meas_tags) and ctrl_tag:
+                if _norm_tag(ctrl_tag) not in norm_self_tags:
+                    control_peer_tags.append((ctrl_tag, "out", f"回路 {lp_id} 控制器"))
+            elif any(_norm_tag(ft) in norm_self_tags for ft in fe_tags) and ctrl_tag:
+                if _norm_tag(ctrl_tag) not in norm_self_tags:
+                    control_peer_tags.append((ctrl_tag, "in", f"回路 {lp_id} 控制器"))
+
+    for il in interlocks_raw:
+        if not isinstance(il, dict):
+            continue
+        il_id = str(il.get("id") or "")
+        il_title = str(il.get("title") or "")
+        il_notes = str(il.get("notes") or "")
+        cause = il.get("cause") if isinstance(il.get("cause"), dict) else {}
+        cause_tag = str(cause.get("tag") or "")
+        cause_cond = str(cause.get("condition") or "")
+        effects = [e for e in (il.get("effects") or []) if isinstance(e, dict) and e.get("tag")]
+        eff_tags = [str(e["tag"]) for e in effects]
+
+        all_il_tags = [t for t in [il_id, cause_tag, *eff_tags] if t]
+        matched = any(_norm_tag(t) in norm_self_tags for t in all_il_tags)
+        if not matched and tag:
+            matched = _tag_in_text(tag, il_notes) or (category == "equipment" and _tag_in_text(tag, il_title))
+        if not matched:
+            continue
+
+        eff_desc = ", ".join(
+            f"{e['tag']} ({e.get('action', '')})".strip() if e.get("action") else str(e["tag"])
+            for e in effects
+        )
+        cause_desc = f"{cause_tag} ({cause_cond})" if cause_cond else cause_tag
+        detail = f"触发: {cause_desc} → 动作: {eff_desc}"
+        if il_notes:
+            detail += f" — {il_notes}"
+        controls.append(
+            {
+                "kind": "interlock",
+                "id": il_id or "Interlock",
+                "title": il_title,
+                "detail": detail,
+            }
+        )
+        il_short = f"{il_id}: {cause_cond or '联锁'} → {eff_desc}" if il_id else detail
+        if il_short not in interlock_parts:
+            interlock_parts.append(il_short)
+        if category in ("instrument", "valve"):
+            if cause_tag and _norm_tag(cause_tag) in norm_self_tags:
+                for et in eff_tags:
+                    if _norm_tag(et) not in norm_self_tags:
+                        control_peer_tags.append((et, "out", f"联锁 {il_id} 动作"))
+            elif any(_norm_tag(et) in norm_self_tags for et in eff_tags) and cause_tag:
+                if _norm_tag(cause_tag) not in norm_self_tags:
+                    control_peer_tags.append((cause_tag, "in", f"联锁 {il_id} 触发"))
+            elif tag and _tag_in_text(tag, il_notes):
+                if cause_tag and _norm_tag(cause_tag) not in norm_self_tags:
+                    control_peer_tags.append((cause_tag, "in", f"联锁 {il_id} 触发"))
+                for et in eff_tags:
+                    if _norm_tag(et) not in norm_self_tags:
+                        control_peer_tags.append((et, "out", f"联锁 {il_id} 动作"))
+
+    # Also check XML InstrumentationLoopFunction
+    for fn in _functions_of(sheet, element):
+        for lp_el in _loops(sheet, fn):
+            lp_tag = _clean_tag(sheet.tag(lp_el)) or lp_el.get("id") or ""
+            if lp_tag and lp_tag not in loop_ids:
+                loop_ids.append(lp_tag)
+
+    # Connections & Parts
+    piping = _piping_index(sheet)
+    outgoing_pipes, incoming_pipes = _pipe_graph(sheet)
+    parts: list[dict[str, Any]] = []
+    connections_list: list[dict[str, Any]] = []
+    seen_conn: set[tuple[str | None, str | None, str | None, str]] = set()
+
+    def _add_conn(entry: dict[str, Any]) -> None:
+        key = (entry.get("from_part"), entry.get("via_tag"), entry.get("other_id"), entry.get("direction", "peer"))
+        if key not in seen_conn:
+            seen_conn.add(key)
+            connections_list.append(entry)
+
+    if category == "equipment":
+        nozzles = [e for e in element.iter("Object") if _is_nozzle(e)]
+        for noz in nozzles:
+            noz_id = noz.get("id") or ""
+            noz_tag = _clean_tag(sheet.tag(noz)) or noz_id
+            noz_dn = _extract_raw_dn(noz)
+            noz_conns = _trace_nozzle_connections(sheet, piping, noz, element)
+            for c in noz_conns:
+                _add_conn(c)
+            conn_summary = (
+                "; ".join(
+                    f"{c['via_tag']} → {c['other_tag']}" if c.get("via_tag") else str(c.get("other_tag") or "")
+                    for c in noz_conns[:2]
+                )
+                or None
+            )
+            parts.append(
+                {
+                    "id": noz_id,
+                    "class": short_class(noz),
+                    "tag": noz_tag,
+                    "dn": noz_dn,
+                    "connected_to": conn_summary,
+                }
+            )
+        # Other non-nozzle, non-node subcomponents
+        for comps in element.findall("Components"):
+            for child in comps.findall("Object"):
+                c_cls = short_class(child)
+                if _is_nozzle(child) or c_cls == "PipingNode" or not child.get("id"):
+                    continue
+                parts.append(
+                    {
+                        "id": child.get("id"),
+                        "class": c_cls,
+                        "tag": _clean_tag(sheet.tag(child)) or child.get("id"),
+                        "dn": _extract_raw_dn(child),
+                        "connected_to": None,
+                    }
+                )
+    elif category == "nozzle":
+        for c in _trace_nozzle_connections(sheet, piping, element, equip_el):
+            _add_conn(c)
+    elif dexpi_class == "PipingNetworkSegment":
+        seg_refs = _references(element)
+        for prop, direction in (("SourceItem", "in"), ("TargetItem", "out")):
+            tid = seg_refs.get(prop)
+            if tid and tid in sheet.by_id:
+                target = sheet.by_id[tid]
+                oid, otag, ocls = _display_item(sheet, target)
+                arrow = "←" if direction == "in" else "→"
+                label_dir = "起点" if direction == "in" else "终点"
+                _add_conn(
+                    {
+                        "via_id": resolved_id,
+                        "via_tag": line_number or resolved_id,
+                        "via_class": "PipingNetworkSegment",
+                        "from_part": None,
+                        "other_id": oid,
+                        "other_tag": otag or oid,
+                        "other_class": ocls,
+                        "direction": direction,
+                        "summary": f"{label_dir} {arrow} {otag or oid} ({ocls})",
+                    }
+                )
+        for item in _ordered_segment_items(element):
+            iid = item.get("id") or ""
+            parts.append(
+                {
+                    "id": iid,
+                    "class": short_class(item),
+                    "tag": _clean_tag(sheet.tag(item)) or iid,
+                    "dn": _extract_raw_dn(item),
+                    "connected_to": None,
+                }
+            )
+    elif dexpi_class == "PipingNetworkSystem":
+        segs = _object_children(element, "Segments")
+        internal_ids: set[str] = set()
+        for seg in segs:
+            for item in _ordered_segment_items(seg):
+                iid = item.get("id") or ""
+                if iid:
+                    internal_ids.add(iid)
+                parts.append(
+                    {
+                        "id": iid,
+                        "class": short_class(item),
+                        "tag": _clean_tag(sheet.tag(item)) or iid,
+                        "dn": _extract_raw_dn(item),
+                        "connected_to": seg.get("id"),
+                    }
+                )
+        for seg in segs:
+            s_id = seg.get("id") or ""
+            seg_refs = _references(seg)
+            for prop, direction in (("SourceItem", "in"), ("TargetItem", "out")):
+                tid = seg_refs.get(prop)
+                if not tid or tid not in sheet.by_id:
+                    continue
+                target = sheet.by_id[tid]
+                t_cls = short_class(target)
+                if tid in internal_ids and not t_cls.endswith("OffPageConnector"):
+                    continue
+                t_equip = _equipment_of(target)
+                if t_equip is not None:
+                    oid = t_equip.get("id") or ""
+                    otag = _clean_tag(sheet.tag(t_equip)) or oid
+                    ocls = short_class(t_equip)
+                    noz_s = _clean_tag(sheet.tag(target)) if _is_nozzle(target) else None
+                    disp = f"{otag}:{noz_s}" if noz_s else otag
+                else:
+                    oid, otag, ocls = _display_item(sheet, target)
+                    disp = otag or oid
+                label_dir = "起点" if direction == "in" else "终点"
+                arrow = "←" if direction == "in" else "→"
+                _add_conn(
+                    {
+                        "via_id": s_id,
+                        "via_tag": line_number or s_id,
+                        "via_class": "PipingNetworkSegment",
+                        "from_part": None,
+                        "other_id": oid,
+                        "other_tag": disp,
+                        "other_class": ocls,
+                        "direction": direction,
+                        "summary": f"{label_dir} {arrow} {disp} ({ocls})",
+                    }
+                )
+    elif category in ("valve", "fitting", "connector", "spec_break"):
+        for nb_id, seg, sys_parent in incoming_pipes.get(resolved_id, []):
+            nb = sheet.by_id.get(nb_id)
+            if nb is None:
+                continue
+            oid, otag, ocls = _display_item(sheet, nb)
+            vtag = _clean_tag(sheet.tag(sys_parent)) if sys_parent is not None else seg.get("id")
+            _add_conn(
+                {
+                    "via_id": seg.get("id"),
+                    "via_tag": vtag,
+                    "via_class": "PipingNetworkSegment",
+                    "from_part": None,
+                    "other_id": oid,
+                    "other_tag": otag or oid,
+                    "other_class": ocls,
+                    "direction": "in",
+                    "summary": f"上游 ← {otag or oid} ({ocls})",
+                }
+            )
+        for nb_id, seg, sys_parent in outgoing_pipes.get(resolved_id, []):
+            nb = sheet.by_id.get(nb_id)
+            if nb is None:
+                continue
+            oid, otag, ocls = _display_item(sheet, nb)
+            vtag = _clean_tag(sheet.tag(sys_parent)) if sys_parent is not None else seg.get("id")
+            _add_conn(
+                {
+                    "via_id": seg.get("id"),
+                    "via_tag": vtag,
+                    "via_class": "PipingNetworkSegment",
+                    "from_part": None,
+                    "other_id": oid,
+                    "other_tag": otag or oid,
+                    "other_class": ocls,
+                    "direction": "out",
+                    "summary": f"下游 → {otag or oid} ({ocls})",
+                }
+            )
+        # XML actuation links for valves
+        for fn in _functions_of(sheet, element):
+            fn_id = fn.get("id") or ""
+            if fn_id and fn_id != resolved_id:
+                fn_tag = _clean_tag(sheet.tag(fn)) or fn_id
+                _add_conn(
+                    {
+                        "via_id": None,
+                        "via_tag": "Instrumentation",
+                        "via_class": "ProcessInstrumentationFunction",
+                        "from_part": None,
+                        "other_id": fn_id,
+                        "other_tag": fn_tag,
+                        "other_class": short_class(fn),
+                        "direction": "in",
+                        "summary": f"控制信号 ← {fn_tag}",
+                    }
+                )
+    elif category == "instrument":
+        # XML SensingLocation, SignalConveyingFunction / SignalLineFunction, ActuatingFunction
+        for sub in element.iter("Object"):
+            sub_cls = short_class(sub)
+            if sub_cls == "ProcessSignalGeneratingFunction":
+                for target in _targets(sheet, sub, "SensingLocation"):
+                    oid, otag, ocls = _display_item(sheet, target)
+                    _add_conn(
+                        {
+                            "via_id": None,
+                            "via_tag": "SensingLocation",
+                            "via_class": "ProcessSignalGeneratingFunction",
+                            "from_part": None,
+                            "other_id": oid,
+                            "other_tag": otag or oid,
+                            "other_class": ocls,
+                            "direction": "in",
+                            "summary": f"测点 ← {otag or oid} ({ocls})",
+                        }
+                    )
+            elif sub_cls in ("SignalConveyingFunction", "SignalLineFunction", "MeasuringLineFunction"):
+                for end_prop, direction in (("Source", "in"), ("Target", "out")):
+                    for target in _targets(sheet, sub, end_prop):
+                        fn = _ancestor_or_self(target, "ProcessInstrumentationFunction") or target
+                        if fn is element:
+                            continue
+                        oid, otag, ocls = _display_item(sheet, fn)
+                        _add_conn(
+                            {
+                                "via_id": sub.get("id"),
+                                "via_tag": sub_cls,
+                                "via_class": sub_cls,
+                                "from_part": None,
+                                "other_id": oid,
+                                "other_tag": otag or oid,
+                                "other_class": ocls,
+                                "direction": direction,
+                                "summary": f"信号 {'←' if direction == 'in' else '→'} {otag or oid}",
+                            }
+                        )
+            elif sub_cls == "ActuatingFunction":
+                for sys_act in _targets(sheet, sub, "Systems"):
+                    for ref_child in sys_act.iter("Object"):
+                        if short_class(ref_child) == "OperatedValveReference":
+                            for valve in _targets(sheet, ref_child, "Valve"):
+                                oid, otag, ocls = _display_item(sheet, valve)
+                                _add_conn(
+                                    {
+                                        "via_id": sys_act.get("id"),
+                                        "via_tag": "ActuatingSystem",
+                                        "via_class": "ActuatingSystem",
+                                        "from_part": None,
+                                        "other_id": oid,
+                                        "other_tag": otag or oid,
+                                        "other_class": ocls,
+                                        "direction": "out",
+                                        "summary": f"驱动 → {otag or oid} ({ocls})",
+                                    }
+                                )
+        # Incoming signal references targeting this instrument
+        for ref_el, prop in sheet.incoming.get(resolved_id, []):
+            if prop in ("Source", "Target"):
+                holder = ref_el.getparent()
+                other_fn = _ancestor_or_self(holder, "ProcessInstrumentationFunction")
+                if other_fn is not None and other_fn is not element:
+                    oid, otag, ocls = _display_item(sheet, other_fn)
+                    direction = "out" if prop == "Source" else "in"
+                    _add_conn(
+                        {
+                            "via_id": holder.get("id"),
+                            "via_tag": short_class(holder),
+                            "via_class": short_class(holder),
+                            "from_part": None,
+                            "other_id": oid,
+                            "other_tag": otag or oid,
+                            "other_class": ocls,
+                            "direction": direction,
+                            "summary": f"信号 {'→' if direction == 'out' else '←'} {otag or oid}",
+                        }
+                    )
+
+    # Resolve control loop / interlock peer tags to clickable sheet objects (when not already connected)
+    for peer_tag, peer_dir, prefix in control_peer_tags:
+        matches = [
+            m
+            for m in sheet.find(peer_tag)
+            if m is not element
+            and not m.get("type", "").startswith(("Core/Diagram.", "Plant/Diagram."))
+        ]
+        # Prefer valves/instruments over labels; pick best single match per peer_tag
+        if matches:
+            target = matches[0]
+            oid, otag, ocls = _display_item(sheet, target)
+            _add_conn(
+                {
+                    "via_id": None,
+                    "via_tag": prefix,
+                    "via_class": "Control",
+                    "from_part": None,
+                    "other_id": oid,
+                    "other_tag": otag or peer_tag,
+                    "other_class": ocls,
+                    "direction": peer_dir,
+                    "summary": f"{prefix}: {otag or peer_tag} ({ocls})",
+                }
+            )
+
+    # ------------------------------------------------------------------
+    # Standard Category Attribute Template (missing fields -> None -> "—")
+    # ------------------------------------------------------------------
+    nom_pressure, material_group = _derive_piping_class(piping_class)
+    spec_material = _lookup_pipe_spec_material(lists, piping_class)
+    dn_fmt = _format_dn(raw_dn)
+    li = list_info or {}
+    ds = datasheet or {}
+
+    def _from_ds(*keys: str) -> str | None:
+        for k in keys:
+            if k in li and li[k] is not None:
+                v = _str_val(li[k])
+                if v:
+                    return v
+        for k in keys:
+            if k in attributes and attributes[k]:
+                return attributes[k]
+        # Also peek into datasheet sections (design, mechanical, process)
+        for sec in (ds, ds.get("design"), ds.get("mechanical"), ds.get("dimensions")):
+            if isinstance(sec, dict):
+                for k in keys:
+                    if k in sec and sec[k] is not None:
+                        v = _str_val(sec[k])
+                        if v:
+                            return v
+        return None
+
+    properties: list[dict[str, str | None]] = []
+
+    if category == "equipment":
+        properties = [
+            {"label": "位号", "key": "TagName", "value": tag or attributes.get("TagName")},
+            {"label": "类型", "key": "DEXPI Class", "value": dexpi_class},
+            {"label": "名称/用途", "key": "service", "value": _from_ds("service")},
+            {"label": "设计压力", "key": "design_pressure_barg", "value": _from_ds("design_pressure_barg", "DesignPressure", "UpperLimitDesignPressure")},
+            {"label": "设计温度", "key": "design_temperature_degc", "value": _from_ds("design_temperature_degc", "DesignTemperature", "UpperLimitDesignTemperature")},
+            {"label": "材质", "key": "material", "value": _from_ds("material", "MaterialOfConstructionCode")},
+            {"label": "尺寸/容积", "key": "dimensions", "value": _from_ds("dimensions", "volume", "capacity", "NominalCapacity")},
+            {"label": "备注", "key": "notes", "value": _from_ds("notes")},
+        ]
+    elif category == "nozzle":
+        # Derive connected line and nominal pressure from attached segment(s)
+        attached_segs = piping.ending_at.get(resolved_id, [])
+        conn_lines: list[str] = []
+        noz_np = attributes.get("NominalPressure")
+        for seg in attached_segs:
+            s_sys = _ancestor_or_self(seg, "PipingNetworkSystem")
+            lno = data_value(s_sys, "LineNumber") if s_sys is not None else seg.get("id")
+            if lno and lno not in conn_lines:
+                conn_lines.append(lno)
+            if not noz_np:
+                pcls = data_value(seg, "PipingClassCode") or (data_value(s_sys, "PipingClassCode") if s_sys is not None else None)
+                noz_np, _ = _derive_piping_class(pcls)
+        properties = [
+            {"label": "管口号", "key": "SubTagName", "value": attributes.get("SubTagName") or tag},
+            {"label": "所属设备", "key": "owner", "value": (owner["tag"] or owner["id"]) if owner else None},
+            {"label": "公称通径", "key": "DN", "value": dn_fmt},
+            {"label": "公称压力", "key": "NominalPressure", "value": noz_np},
+            {"label": "连接管线", "key": "connected_line", "value": ", ".join(conn_lines) if conn_lines else None},
+        ]
+    elif category == "pipe":
+        seg_display = (
+            resolved_id
+            if dexpi_class == "PipingNetworkSegment"
+            else (
+                f"{len(_object_children(element, 'Segments'))} 段"
+                if dexpi_class == "PipingNetworkSystem"
+                else None
+            )
+        )
+        in_conns = [c["other_tag"] for c in connections_list if c["direction"] == "in" and c.get("other_tag")]
+        out_conns = [c["other_tag"] for c in connections_list if c["direction"] == "out" and c.get("other_tag")]
+        xml_from = ", ".join(dict.fromkeys(in_conns)) or None
+        xml_to = ", ".join(dict.fromkeys(out_conns)) or None
+        if dexpi_class == "PipingNetworkSegment":
+            from_val = xml_from or _str_val(li.get("from"))
+            to_val = xml_to or _str_val(li.get("to"))
+        else:
+            from_val = _str_val(li.get("from")) or xml_from
+            to_val = _str_val(li.get("to")) or xml_to
+        properties = [
+            {"label": "管线号", "key": "LineNumber", "value": line_number},
+            {"label": "管段号", "key": "Segment", "value": seg_display},
+            {"label": "公称通径", "key": "DN", "value": dn_fmt},
+            {"label": "介质", "key": "FluidCode", "value": fluid_code},
+            {"label": "管道等级", "key": "PipingClassCode", "value": piping_class},
+            {"label": "材质等级", "key": "MaterialGroup", "value": f"{material_group} / {spec_material}" if (material_group and spec_material) else (spec_material or material_group)},
+            {"label": "绝热/伴热", "key": "InsulationType", "value": _from_ds("insulation", "InsulationType", "HeatTracingType")},
+            {"label": "起点", "key": "from", "value": from_val},
+            {"label": "终点", "key": "to", "value": to_val},
+        ]
+    elif category == "valve":
+        notes_text = _from_ds("notes", "relief_case", "service")
+        if not fail_position:
+            fail_position = attributes.get("FailAction") or attributes.get("FailPosition")
+        if not fail_position and notes_text:
+            m_fail = _FAIL_POS_RE.search(notes_text)
+            if m_fail:
+                code = m_fail.group(1)
+                fail_position = {"FC": "FC (故障关)", "FO": "FO (故障开)", "FL": "FL (故障保位)"}.get(code, code)
+        if not actuator_op:
+            actuator_op = attributes.get("Operation") or attributes.get("ActuatorType")
+        if not actuator_op and notes_text:
+            if "电磁" in notes_text:
+                actuator_op = "电磁驱动"
+            elif "气动" in notes_text:
+                actuator_op = "气动"
+            elif "电动" in notes_text:
+                actuator_op = "电动"
+            elif "手动" in notes_text:
+                actuator_op = "手动"
+        set_p = _from_ds("set_pressure_barg", "SetPressure")
+        if set_p and "set_pressure_barg" in li and not any(u in set_p.lower() for u in ("bar", "kpa", "mpa")):
+            set_p = f"{set_p} barg"
+        properties = [
+            {"label": "位号", "key": "Tag", "value": tag},
+            {"label": "阀门类型", "key": "DEXPI Class", "value": dexpi_class},
+            {"label": "所在管线", "key": "LineNumber", "value": line_number},
+            {"label": "公称通径", "key": "DN", "value": dn_fmt},
+            {"label": "管道等级", "key": "PipingClassCode", "value": piping_class},
+            {"label": "阀体材质", "key": "Material", "value": _from_ds("material", "MaterialOfConstructionCode") or spec_material or material_group},
+            {"label": "连接形式", "key": "end_connection", "value": _from_ds("end_connection", "EndConnection")},
+            {"label": "故障位", "key": "FailPosition", "value": fail_position},
+            {"label": "驱动方式", "key": "Operation", "value": actuator_op},
+            {"label": "整定压力", "key": "SetPressure", "value": set_p},
+            {"label": "备注", "key": "notes", "value": notes_text},
+        ]
+    elif category == "fitting":
+        if dexpi_class == "PipeTee":
+            tee_dns: list[str] = []
+            if raw_dn:
+                for part in re.split(r"[×xX/]", raw_dn):
+                    p = part.strip()
+                    if p and p not in tee_dns:
+                        tee_dns.append(p)
+            for _nb_id, seg, _sys_p in incoming_pipes.get(resolved_id, []) + outgoing_pipes.get(resolved_id, []):
+                seg_dn = _extract_raw_dn(seg)
+                if seg_dn:
+                    for part in re.split(r"[×xX/]", seg_dn):
+                        p = part.strip()
+                        if p and p not in tee_dns:
+                            tee_dns.append(p)
+            if tee_dns:
+                dn_fmt = " × ".join(p if p.upper().startswith("DN") else f"DN{p}" for p in tee_dns)
+        properties = [
+            {"label": "位号/标识", "key": "Tag", "value": tag or resolved_id},
+            {"label": "管件类型", "key": "DEXPI Class", "value": dexpi_class},
+            {"label": "所在管线", "key": "LineNumber", "value": line_number},
+            {"label": "公称通径", "key": "DN", "value": dn_fmt},
+            {"label": "管道等级", "key": "PipingClassCode", "value": piping_class},
+            {"label": "材质", "key": "Material", "value": _from_ds("material", "MaterialOfConstructionCode") or spec_material or material_group},
+            {"label": "备注", "key": "notes", "value": _from_ds("notes", "service")},
+        ]
+        if dexpi_class == "PipeTee":
+            distinct_lines = list(dict.fromkeys(
+                c["via_tag"].strip()
+                for c in connections_list
+                if isinstance(c.get("via_tag"), str) and c["via_tag"].strip()
+            ))
+            if len(distinct_lines) >= 2:
+                properties.append({"label": "管道号分界", "key": "line_transition", "value": " ↔ ".join(distinct_lines)})
+    elif category == "spec_break":
+        up_cls = attributes.get("UpstreamClass")
+        dn_cls = attributes.get("DownstreamClass")
+        if not up_cls:
+            for nb_id, seg, sys_p in incoming_pipes.get(resolved_id, []):
+                nb = sheet.by_id.get(nb_id)
+                up_cls = (
+                    (data_value(nb, "PipingClassCode") if nb is not None else None)
+                    or data_value(seg, "PipingClassCode")
+                    or (data_value(sys_p, "PipingClassCode") if sys_p is not None else None)
+                )
+                if up_cls:
+                    break
+        if not dn_cls:
+            for nb_id, seg, sys_p in outgoing_pipes.get(resolved_id, []):
+                nb = sheet.by_id.get(nb_id)
+                dn_cls = (
+                    (data_value(nb, "PipingClassCode") if nb is not None else None)
+                    or data_value(seg, "PipingClassCode")
+                    or (data_value(sys_p, "PipingClassCode") if sys_p is not None else None)
+                )
+                if dn_cls:
+                    break
+        gov_cls = attributes.get("GoverningClass")
+        if not gov_cls and up_cls and dn_cls:
+            gov_cls = up_cls if _piping_class_rank(up_cls) >= _piping_class_rank(dn_cls) else dn_cls
+        if gov_cls:
+            boundary_valves: list[str] = []
+            for _nb_id, _seg, _sys_p in incoming_pipes.get(resolved_id, []) + outgoing_pipes.get(resolved_id, []):
+                nb = sheet.by_id.get(_nb_id)
+                if nb is not None and _classify_pid_object(nb)[0] == "valve":
+                    vtag = _clean_tag(sheet.tag(nb)) or data_value(nb, "PipingComponentNumber") or _nb_id
+                    if vtag and vtag not in boundary_valves:
+                        boundary_valves.append(vtag)
+            if not boundary_valves:
+                for c in connections_list:
+                    oid = c.get("other_id")
+                    nb = sheet.by_id.get(oid) if oid else None
+                    if nb is not None and _classify_pid_object(nb)[0] == "valve":
+                        vtag = c.get("other_tag") or oid
+                        if vtag and vtag not in boundary_valves:
+                            boundary_valves.append(vtag)
+            if boundary_valves and "边界阀门" not in gov_cls:
+                gov_cls = f"{gov_cls} (边界阀门: {', '.join(boundary_valves)})"
+        change_note = attributes.get("ChangeNote") or _from_ds("notes")
+        if not change_note and up_cls and dn_cls:
+            _, up_mg = _derive_piping_class(up_cls)
+            _, dn_mg = _derive_piping_class(dn_cls)
+            change_note = f"{up_mg or up_cls} → {dn_mg or dn_cls}"
+        properties = [
+            {"label": "所在管线", "key": "LineNumber", "value": line_number},
+            {"label": "上游等级", "key": "UpstreamClass", "value": up_cls},
+            {"label": "下游等级", "key": "DownstreamClass", "value": dn_cls},
+            {"label": "边界阀门适用等级", "key": "GoverningClass", "value": gov_cls},
+            {"label": "材质/压力变化说明", "key": "ChangeNote", "value": change_note},
+        ]
+    elif category == "instrument":
+        cat_letters = "".join(
+            v
+            for v in (
+                attributes.get("ProcessInstrumentationFunctionCategory"),
+                attributes.get("ProcessInstrumentationFunctions"),
+            )
+            if v
+        ) or None
+        inst_num = attributes.get("ProcessInstrumentationFunctionNumber")
+        alarms_and_il = "; ".join([*alarm_parts, *interlock_parts]) or None
+        properties = [
+            {"label": "位号", "key": "Tag", "value": tag},
+            {"label": "功能分类", "key": "Category", "value": cat_letters},
+            {"label": "顺序号", "key": "Number", "value": inst_num},
+            {"label": "测量/用途", "key": "service", "value": _from_ds("service")},
+            {"label": "安装位置", "key": "Location", "value": _from_ds("Location", "location", "MountingLocation")},
+            {"label": "报警/联锁", "key": "Alarms / Interlock", "value": alarms_and_il},
+            {"label": "所属回路", "key": "Loop", "value": ", ".join(loop_ids) if loop_ids else None},
+        ]
+    elif category == "connector":
+        dir_label = "流入 (FlowIn)" if "FlowIn" in dexpi_class else "流出 (FlowOut)"
+        properties = [
+            {"label": "位号/图号", "key": "PipeConnectorNumber", "value": tag or resolved_id},
+            {"label": "方向", "key": "Direction", "value": dir_label},
+            {"label": "所在管线", "key": "LineNumber", "value": line_number},
+            {"label": "公称通径", "key": "DN", "value": dn_fmt},
+            {"label": "管道等级", "key": "PipingClassCode", "value": piping_class},
+            {"label": "备注", "key": "notes", "value": _from_ds("notes")},
+        ]
+    else:
+        properties = [
+            {"label": "标识", "key": "id", "value": resolved_id},
+            {"label": "类型", "key": "DEXPI Class", "value": dexpi_class},
+            *({"label": k, "key": k, "value": v} for k, v in attributes.items()),
+        ]
+
+    span = sheet.span.get(element)
+    xml_lines = [span[0], span[1]] if span else ([element.sourceline, element.sourceline] if element.sourceline else None)
+
+    return {
+        "id": resolved_id,
+        "dexpi_class": dexpi_class,
+        "category": category,
+        "category_label": category_label,
+        "tag": tag,
+        "owner": owner,
+        "attributes": attributes,
+        "properties": properties,
+        "list_info": list_info,
+        "parts": parts,
+        "connections": connections_list,
+        "controls": controls,
+        "xml_lines": xml_lines,
+    }
+
+
 def create_app(
     repo_root: Path,
     ui_dir: Path | None = None,
@@ -580,6 +1968,7 @@ def create_app(
     if ui is not None and not (ui / "index.html").is_file():
         raise FileNotFoundError(f"{ui} has no index.html")
     svg_cache = _LRU(128)
+    sheet_cache = _LRU(32)
     diff_cache = _LRU(64)
     tags_cache = _LRU(128)
     process_cache = _LRU(16)
@@ -879,6 +2268,37 @@ def create_app(
         snapshot = repo.snapshot(rev)
         content, sha = _need(snapshot, path)
         return Response(_svg(path, content, sha), media_type="image/svg+xml", headers=_SVG_HEADERS)
+
+    @app.get("/api/pid/object")
+    def get_pid_object(path: str, id: str, rev: str | None = None) -> dict[str, Any]:
+        """Inspect one object on a P&ID sheet: standard category properties, YAML list metadata,
+        clickable upstream/downstream connections, nozzles/inline parts, and control/interlock
+        records. Fast XML-only lookup cached by blob id."""
+        snapshot = repo.snapshot(rev)
+        content, sha = _need(snapshot, path)
+        sheet: Sheet = sheet_cache.get_or_compute(
+            (path, sha), lambda: _sheet_from_bytes(content, path)
+        )
+        lists = {
+            kind: _safe_yaml_dict(snapshot, _small, LIST_FILES[kind])
+            for kind in ("equipment", "lines", "piping_items", "instruments", "loops", "interlocks")
+        }
+        pipe_specs = _safe_yaml_dict(snapshot, _small, LAYOUT_FILES["pipe_specs"])
+        if pipe_specs:
+            lists["pipe_specs"] = pipe_specs
+        # Optional equipment datasheet enrichment if an equipment tag matches
+        datasheet: dict[str, Any] | None = None
+        el = _resolve_pid_element(sheet, id)
+        if is_equipment(el):
+            eq_tag = _clean_tag(sheet.tag(el))
+            if eq_tag and "/" not in eq_tag and "\\" not in eq_tag and ".." not in eq_tag:
+                for ext in (".yaml", ".yml"):
+                    ds_path = f"equipment/datasheets/{eq_tag}{ext}"
+                    ds_data = _safe_yaml_dict(snapshot, _small, ds_path)
+                    if ds_data:
+                        datasheet = ds_data
+                        break
+        return _inspect_pid_object(sheet, id, lists, datasheet=datasheet)
 
     @app.get("/api/diff")
     def get_diff(path: str, old: str = "HEAD", new: str | None = None) -> dict[str, Any]:

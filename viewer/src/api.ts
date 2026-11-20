@@ -3026,6 +3026,61 @@ export interface IssuesReport {
   issues: Issue[];
 }
 
+export interface PidObjectRef {
+  id: string;
+  class: string;
+  tag: string | null;
+}
+
+export interface PidObjectProperty {
+  label: string;
+  key: string;
+  value: string | null;
+}
+
+export interface PidObjectPart {
+  id: string;
+  class: string;
+  tag: string | null;
+  dn: string | null;
+  connected_to: string | null;
+}
+
+export interface PidObjectConnection {
+  via_id: string | null;
+  via_tag: string | null;
+  via_class: string | null;
+  from_part: string | null;
+  other_id: string | null;
+  other_tag: string | null;
+  other_class: string | null;
+  direction: "out" | "in" | "peer";
+  summary: string;
+}
+
+export interface PidObjectControl {
+  kind: "loop" | "interlock";
+  id: string;
+  title: string;
+  detail: string;
+}
+
+export interface PidObjectInfo {
+  id: string;
+  dexpi_class: string;
+  category: string;
+  category_label: string;
+  tag: string | null;
+  owner: PidObjectRef | null;
+  attributes: Record<string, string>;
+  properties: PidObjectProperty[];
+  list_info: Record<string, unknown> | null;
+  parts: PidObjectPart[];
+  connections: PidObjectConnection[];
+  controls: PidObjectControl[];
+  xml_lines: [number, number] | null;
+}
+
 /**
  * The JSON answer of each endpoint (`/api/<key>`): the one place that ties an endpoint to its
  * response type, so every request below and the endpoint names in its URL agree.
@@ -3035,6 +3090,7 @@ export interface JsonEndpoints {
   branches: Branch[];
   log: Commit[];
   tree: TreeEntry[];
+  "pid/object": PidObjectInfo;
   diff: SheetDiff;
   validate: ValidationReport;
   checks: ChecksReport;
@@ -3268,6 +3324,9 @@ export const api = {
     snapshot?.url("pid.svg", { path, rev: revParam(rev) }) ?? apiUrl("pid.svg", { path, rev: revParam(rev) }),
   pidSvg: (path: string, rev?: Rev, signal?: AbortSignal) =>
     getText("pid.svg", { path, rev: revParam(rev) }, signal),
+  /** Rich engineering metadata, category properties, connections and controls of one P&ID object. */
+  pidObject: (path: string, id: string, rev?: Rev, signal?: AbortSignal) =>
+    getJson("pid/object", { path, id, rev: revParam(rev) }, signal),
   diff: (path: string, oldRev: string, newRev?: Rev, signal?: AbortSignal) =>
     snapshot
       ? Promise.reject(snapshotRefusal("Comparing revisions"))

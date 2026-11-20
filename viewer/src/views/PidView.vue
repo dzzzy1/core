@@ -47,6 +47,29 @@ const streams = useAsync(
   async (signal) => (isProcess.value ? api.streams({ rev: rev.value }, signal) : null),
   [isProcess, rev],
 );
+// P&ID: inspect the picked object's rich engineering properties, connections, parts and controls.
+const objectInfo = useAsync(
+  async (signal) => {
+    const id = picked.value?.id;
+    if (!id || isProcess.value) return null;
+    try {
+      return await api.pidObject(path.value, id, rev.value, signal);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") throw error;
+      return null;
+    }
+  },
+  [() => picked.value?.id ?? null, isProcess, path, rev],
+);
+function focusObject(id: string): void {
+  if (!id) return;
+  const layer = document.querySelector('[id="pid-layer"]');
+  const el = layer?.querySelector(`[id="${cssString(id)}"]`) ?? (layer ? findTagGroup(layer, id) : null);
+  const target = el?.id || id;
+  const texts = el ? [...new Set(Array.from(el.querySelectorAll("text"), (t) => (t.textContent ?? "").trim()).filter(Boolean))] : [];
+  picked.value = { id: target, layer: "pid-layer", className: el?.getAttribute("class") ?? "", texts: texts.slice(0, 20) };
+  pane.value?.focus(target);
+}
 const layers = computed(() => [{ id: "pid-layer", svg: svg.data.value }]);
 const css = computed(() => selectionCss("pid-layer", picked.value?.id ?? null));
 /**
@@ -193,7 +216,15 @@ const diffQuery = computed(() => (rev.value ? { old: rev.value, rev: rev.value }
         :issue="issueLink"
         @close="picked = null"
       />
-      <InfoPanel v-else :picked="picked" :issue="issueLink" @close="picked = null" />
+      <InfoPanel
+        v-else
+        :picked="picked"
+        :info="objectInfo.data.value ?? null"
+        :loading="objectInfo.loading.value"
+        :issue="issueLink"
+        @close="picked = null"
+        @select="focusObject($event)"
+      />
     </div>
   </div>
 </template>
